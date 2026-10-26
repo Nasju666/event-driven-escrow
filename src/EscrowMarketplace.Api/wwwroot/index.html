@@ -408,7 +408,7 @@
       text-transform: uppercase;
       letter-spacing: 0.04em;
     }
-    .status-Created { background: rgba(99, 102, 241, 0.15); color: #818cf8; border: 1px solid rgba(99, 102, 241, 0.3); }
+    .status-PendingPayment, .status-Created { background: rgba(99, 102, 241, 0.15); color: #818cf8; border: 1px solid rgba(99, 102, 241, 0.3); }
     .status-Held { background: rgba(245, 158, 11, 0.15); color: #fbbf24; border: 1px solid rgba(245, 158, 11, 0.3); }
     .status-Confirmed { background: rgba(6, 182, 212, 0.15); color: #22d3ee; border: 1px solid rgba(6, 182, 212, 0.3); }
     .status-Completed { background: rgba(16, 185, 129, 0.15); color: #34d399; border: 1px solid rgba(16, 185, 129, 0.3); }
@@ -1144,11 +1144,25 @@
           const startFormatted = new Date(b.startTime).toLocaleString([], { dateStyle: 'short', timeStyle: 'short' });
           const endFormatted = new Date(b.endTime).toLocaleTimeString([], { timeStyle: 'short' });
           
+          const statusMap = {
+            0: 'PendingPayment',
+            1: 'Held',
+            2: 'Confirmed',
+            3: 'InService',
+            4: 'Completed',
+            5: 'Cancelled',
+            6: 'Expired',
+            7: 'Refunded',
+            8: 'Disputed'
+          };
+          const rawStatus = b.status;
+          const statusName = typeof rawStatus === 'number' ? (statusMap[rawStatus] || 'Unknown') : rawStatus;
+
           // Stepper states
           const isCreated = true;
-          const isHeld = b.status === 'Held' || b.status === 'Confirmed' || b.status === 'Completed';
-          const isConfirmed = b.status === 'Confirmed' || b.status === 'Completed';
-          const isCompleted = b.status === 'Completed';
+          const isHeld = statusName === 'Held' || statusName === 'Confirmed' || statusName === 'Completed';
+          const isConfirmed = statusName === 'Confirmed' || statusName === 'Completed';
+          const isCompleted = statusName === 'Completed';
 
           return `
             <div class="booking-card" id="bookingCard-${b.id}">
@@ -1159,7 +1173,7 @@
                     ${b.resourceTitle || 'Studio Session'}
                   </div>
                 </div>
-                <span class="status-badge status-${b.status}">${b.status}</span>
+                <span class="status-badge status-${statusName}">${statusName}</span>
               </div>
 
               <!-- Workflow Stepper -->
@@ -1169,12 +1183,12 @@
                   <span>Created</span>
                 </div>
                 <div class="step-line ${isHeld ? 'active' : ''}"></div>
-                <div class="step-node ${isHeld ? 'completed' : (b.status === 'Created' ? 'active' : '')}">
+                <div class="step-node ${isHeld ? 'completed' : (statusName === 'PendingPayment' ? 'active' : '')}">
                   <div class="step-circle">2</div>
                   <span>Held / Funded</span>
                 </div>
                 <div class="step-line ${isConfirmed ? 'active' : ''}"></div>
-                <div class="step-node ${isConfirmed ? 'completed' : (b.status === 'Held' ? 'active' : '')}">
+                <div class="step-node ${isConfirmed ? 'completed' : (statusName === 'Held' ? 'active' : '')}">
                   <div class="step-circle">3</div>
                   <span>Confirmed</span>
                 </div>
@@ -1206,20 +1220,20 @@
               </div>
 
               <!-- Action Controls -->
-              <div class="booking-actions">
-                ${b.status === 'Created' ? `
+              <div class="booking-actions" style="margin-top: 14px; display: flex; gap: 8px; flex-wrap: wrap;">
+                ${(statusName === 'PendingPayment' || statusName === 'Created') ? `
                   <button class="btn btn-primary btn-sm" onclick="authorizeAndFundEscrow('${b.id}')">
                     💳 Authorize & Fund Escrow
                   </button>
                 ` : ''}
 
-                ${b.status === 'Held' ? `
+                ${statusName === 'Held' ? `
                   <button class="btn btn-primary btn-sm" onclick="confirmBooking('${b.id}')">
                     ✅ Host Confirms Booking
                   </button>
                 ` : ''}
 
-                ${(b.status === 'Held' || b.status === 'Confirmed') ? `
+                ${(statusName === 'Held' || statusName === 'Confirmed') ? `
                   <button class="btn btn-primary btn-sm" style="background: var(--success);" onclick="completeBooking('${b.id}')">
                     🏁 Complete Session & Release Escrow
                   </button>
@@ -1228,10 +1242,16 @@
                   </button>
                 ` : ''}
 
-                ${(b.status === 'Created' || b.status === 'Held' || b.status === 'Disputed') ? `
+                ${(statusName !== 'Completed' && statusName !== 'Cancelled' && statusName !== 'Refunded') ? `
                   <button class="btn btn-danger btn-sm" onclick="cancelBooking('${b.id}')">
                     Cancel & Refund
                   </button>
+                ` : ''}
+
+                ${statusName === 'Completed' ? `
+                  <div style="color: var(--success); font-weight: 700; font-size: 0.85rem; display: flex; align-items: center; gap: 6px;">
+                    ✨ Funds Disbursed & Settled
+                  </div>
                 ` : ''}
               </div>
             </div>

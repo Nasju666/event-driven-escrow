@@ -79,8 +79,12 @@ builder.Services.AddRateLimiter(options =>
     });
 });
 
-// 5. Controllers & OpenAPI / Scalar
-builder.Services.AddControllers();
+// 5. Controllers with String Enum Serialization & OpenAPI / Scalar
+builder.Services.AddControllers()
+    .AddJsonOptions(options =>
+    {
+        options.JsonSerializerOptions.Converters.Add(new System.Text.Json.Serialization.JsonStringEnumConverter());
+    });
 builder.Services.AddOpenApi();
 builder.Services.AddEndpointsApiExplorer();
 
