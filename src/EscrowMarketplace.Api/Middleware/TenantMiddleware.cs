@@ -20,8 +20,8 @@ public class TenantMiddleware
     {
         var path = context.Request.Path.Value?.ToLowerInvariant() ?? string.Empty;
 
-        // Skip tenant check for swagger, scalar, health endpoints, or root
-        if (path.StartsWith("/swagger") || path.StartsWith("/scalar") || path.StartsWith("/health") || path.StartsWith("/hangfire") || path == "/")
+        // Skip tenant check for swagger, scalar, openapi, health endpoints, or root
+        if (path.StartsWith("/swagger") || path.StartsWith("/scalar") || path.StartsWith("/openapi") || path.StartsWith("/health") || path.StartsWith("/hangfire") || path == "/")
         {
             await _next(context);
             return;
