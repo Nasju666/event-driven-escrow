@@ -94,6 +94,9 @@ using (var scope = app.Services.CreateScope())
 }
 
 // 7. Middlewares Pipeline
+app.UseDefaultFiles();
+app.UseStaticFiles();
+
 app.UseMiddleware<GlobalExceptionMiddleware>();
 app.UseMiddleware<TenantMiddleware>();
 
@@ -113,9 +116,6 @@ if (app.Environment.IsDevelopment() || true)
         options.Theme = ScalarTheme.Purple;
         options.DefaultHttpClient = new KeyValuePair<ScalarTarget, ScalarClient>(ScalarTarget.CSharp, ScalarClient.HttpClient);
     });
-
-    // Auto-redirect root URL to Scalar documentation
-    app.MapGet("/", () => Results.Redirect("/scalar/v1"));
 }
 
 // 9. SignalR Hub Mapping with Authentication Expiration & Refresh Options

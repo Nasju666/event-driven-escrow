@@ -2,6 +2,7 @@ using EscrowMarketplace.Infrastructure.Persistence;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 
 namespace EscrowMarketplace.IntegrationTests;
@@ -12,11 +13,10 @@ public class CustomWebApplicationFactory : WebApplicationFactory<Program>
 
     protected override void ConfigureWebHost(IWebHostBuilder builder)
     {
-        builder.UseEnvironment("Development");
+        builder.UseEnvironment("Testing");
 
         builder.ConfigureServices(services =>
         {
-            // Replace DbContext with an isolated in-memory test database instance
             var descriptor = services.SingleOrDefault(
                 d => d.ServiceType == typeof(DbContextOptions<MarketplaceDbContext>));
 
