@@ -36,7 +36,7 @@
       font-family: var(--font);
       min-height: 100vh;
       line-height: 1.5;
-      padding-bottom: 60px;
+      padding-bottom: 160px;
     }
 
     /* Header Nav */
@@ -908,7 +908,8 @@
         }
         const data = await res.json();
         jwtToken = data.token;
-        logTelemetry('Auth', `JWT issued for ${currentUser.email} (expires: ${new Date(data.expiresAtUtc).toLocaleTimeString()})`);
+        const expDate = data.expiresAt ? new Date(data.expiresAt) : (data.expiresAtUtc ? new Date(data.expiresAtUtc) : new Date(Date.now() + 7200000));
+        logTelemetry('Auth', `JWT issued for ${currentUser.email} (expires: ${expDate.toLocaleTimeString()})`);
       } catch (err) {
         logTelemetry('Error', `Auth error: ${err.message}`);
       }
@@ -1102,6 +1103,15 @@
         closeModal();
         await loadBookings();
         await loadAnalytics();
+
+        setTimeout(() => {
+          const card = document.getElementById(`bookingCard-${created.id}`);
+          if (card) {
+            card.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            card.classList.add('highlight');
+            setTimeout(() => card.classList.remove('highlight'), 3000);
+          }
+        }, 100);
       } catch (err) {
         logTelemetry('Error', `Booking conflict / error: ${err.message}`);
         alert(`Booking Failed:\n${err.message}`);
