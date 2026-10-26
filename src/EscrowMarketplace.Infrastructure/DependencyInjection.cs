@@ -23,10 +23,12 @@ public static class DependencyInjection
         var connectionString = configuration.GetConnectionString("DefaultConnection") 
             ?? "Host=localhost;Port=5432;Database=EscrowMarketplaceDb;Username=postgres;Password=postgres";
 
+        var useInMemory = configuration.GetValue<bool>("UseInMemoryDatabase");
+
         // 1. EF Core DbContext with Npgsql & btree_gist
         services.AddDbContext<MarketplaceDbContext>(options =>
         {
-            if (configuration.GetValue<bool>("UseInMemoryDatabase"))
+            if (useInMemory)
             {
                 options.UseInMemoryDatabase("EscrowMarketplaceTestDb");
                 options.ConfigureWarnings(w => w.Ignore(Microsoft.EntityFrameworkCore.Diagnostics.InMemoryEventId.TransactionIgnoredWarning));
@@ -72,32 +74,47 @@ public static class DependencyInjection
             busConfig.AddConsumer<EscrowStatusChangedSignalRConsumer>();
             busConfig.AddConsumer<BookingEventAuditConsumer>();
 
-            // Register Escrow Saga State Machine with Optimistic Concurrency (xmin)
-            busConfig.AddSagaStateMachine<EscrowStateMachine, EscrowBookingState>()
-                .EntityFrameworkRepository(r =>
-                {
-                    r.ExistingDbContext<MarketplaceDbContext>();
-                    r.UsePostgres();
-                    r.ConcurrencyMode = ConcurrencyMode.Optimistic;
-                });
-
-            // Register Transactional Outbox
-            busConfig.AddEntityFrameworkOutbox<MarketplaceDbContext>(o =>
+            // Register Escrow Saga State Machine
+            if (useInMemory)
             {
-                o.UsePostgres();
-                o.UseBusOutbox(bo =>
-                {
-                    bo.MessageDeliveryLimit = 100;
-                    bo.MessageDeliveryTimeout = TimeSpan.FromSeconds(45);
-                });
-                o.QueryDelay = TimeSpan.FromSeconds(5);
-            });
+                busConfig.AddSagaStateMachine<EscrowStateMachine, EscrowBookingState>()
+                    .InMemoryRepository();
+            }
+            else
+            {
+                busConfig.AddSagaStateMachine<EscrowStateMachine, EscrowBookingState>()
+                    .EntityFrameworkRepository(r =>
+                    {
+                        r.ExistingDbContext<MarketplaceDbContext>();
+                        r.UsePostgres();
+                        r.ConcurrencyMode = ConcurrencyMode.Optimistic;
+                    });
 
-            // Endpoint callbacks configuring retry and EF Core consumer outbox
+                // Register Transactional Outbox (Postgres only)
+                busConfig.AddEntityFrameworkOutbox<MarketplaceDbContext>(o =>
+                {
+                    o.UsePostgres();
+                    o.UseBusOutbox(bo =>
+                    {
+                        bo.MessageDeliveryLimit = 100;
+                        bo.MessageDeliveryTimeout = TimeSpan.FromSeconds(45);
+                    });
+                    o.QueryDelay = TimeSpan.FromSeconds(5);
+                });
+            }
+
+            // Endpoint callbacks configuring retry and Outbox
             busConfig.AddConfigureEndpointsCallback((context, name, cfg) =>
             {
                 cfg.UseMessageRetry(r => r.Immediate(5));
-                cfg.UseEntityFrameworkOutbox<MarketplaceDbContext>(context);
+                if (!useInMemory)
+                {
+                    cfg.UseEntityFrameworkOutbox<MarketplaceDbContext>(context);
+                }
+                else
+                {
+                    cfg.UseInMemoryOutbox(context);
+                }
             });
 
             // Transport: RabbitMQ if configured, else In-Memory with full outbox features
