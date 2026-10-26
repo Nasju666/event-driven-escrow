@@ -1072,6 +1072,7 @@
       try {
         const payload = {
           resourceId: selectedStudio.id,
+          buyerId: currentUser.id,
           startTime: startDate.toISOString(),
           endTime: endDate.toISOString(),
           notes: notes
@@ -1088,8 +1089,12 @@
         });
 
         if (!res.ok) {
-          const errData = await res.json();
-          throw new Error(errData.detail || errData.title || 'Booking failed');
+          const errData = await res.json().catch(() => null) || {};
+          let msg = errData.detail || errData.title || 'Booking failed';
+          if (errData.errors) {
+            msg = Object.values(errData.errors).flat().join('\n');
+          }
+          throw new Error(msg);
         }
 
         const created = await res.json();
@@ -1099,7 +1104,7 @@
         await loadAnalytics();
       } catch (err) {
         logTelemetry('Error', `Booking conflict / error: ${err.message}`);
-        alert(`Booking Failed: ${err.message}`);
+        alert(`Booking Failed:\n${err.message}`);
       }
     }
 
@@ -1374,6 +1379,7 @@
           },
           body: JSON.stringify({
             resourceId: targetStudio.id,
+            buyerId: currentUser.id,
             startTime: startIso,
             endTime: endIso,
             notes: 'First confirmed reservation'
@@ -1381,8 +1387,8 @@
         });
 
         if (!res1.ok) {
-          const err1 = await res1.json();
-          logTelemetry('TestClash', `First slot already occupied or failed: ${err1.detail}`);
+          const err1 = await res1.json().catch(() => null) || {};
+          logTelemetry('TestClash', `First slot already occupied or failed: ${err1.detail || err1.title}`);
         } else {
           logTelemetry('TestClash', `First reservation confirmed! Now attempting SECOND overlapping reservation...`);
         }
@@ -1402,6 +1408,7 @@
           },
           body: JSON.stringify({
             resourceId: targetStudio.id,
+            buyerId: currentUser.id,
             startTime: overlapStart,
             endTime: overlapEnd,
             notes: 'Intentionally overlapping collision booking'

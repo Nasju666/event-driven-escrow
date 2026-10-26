@@ -26,6 +26,18 @@ public class BookingsController : ControllerBase
         [FromBody] CreateBookingCommand command,
         CancellationToken cancellationToken)
     {
+        // Auto-populate buyerId from authenticated user claim if not explicitly provided
+        if (command.BuyerId == Guid.Empty && User.Identity?.IsAuthenticated == true)
+        {
+            var userIdClaim = User.FindFirst(System.Security.Claims.ClaimTypes.NameIdentifier)?.Value
+                ?? User.FindFirst("sub")?.Value;
+
+            if (Guid.TryParse(userIdClaim, out var buyerGuid))
+            {
+                command = command with { BuyerId = buyerGuid };
+            }
+        }
+
         var result = await _sender.Send(command, cancellationToken);
         return CreatedAtAction(nameof(GetBookingById), new { id = result.Id }, result);
     }
