@@ -142,6 +142,8 @@ if (!builder.Configuration.GetValue<bool>("UseInMemoryDatabase"))
 
 app.MapControllers();
 
+app.Logger.LogInformation("Scalar Interactive API Reference available at: http://localhost:5000/scalar/v1 (or http://localhost:5090/scalar/v1)");
+
 app.Run();
 
 // Required for WebApplicationFactory in integration tests
