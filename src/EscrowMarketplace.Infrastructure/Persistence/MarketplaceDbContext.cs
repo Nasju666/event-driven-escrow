@@ -175,12 +175,13 @@ public class MarketplaceDbContext : DbContext, IMarketplaceDbContext
                 var parameter = Expression.Parameter(entityType.ClrType, "e");
                 var tenantProperty = Expression.Property(parameter, nameof(ITenantEntity.TenantId));
                 var currentTenantId = Expression.Property(Expression.Constant(this), nameof(CurrentTenantId));
+                var nullableTenantProperty = Expression.Convert(tenantProperty, typeof(Guid?));
 
-                // e => CurrentTenantId == null || e.TenantId == CurrentTenantId
+                // e => CurrentTenantId == null || (Guid?)e.TenantId == CurrentTenantId
                 var filter = Expression.Lambda(
                     Expression.OrElse(
                         Expression.Equal(currentTenantId, Expression.Constant(null, typeof(Guid?))),
-                        Expression.Equal(tenantProperty, Expression.Convert(currentTenantId, typeof(Guid)))),
+                        Expression.Equal(nullableTenantProperty, currentTenantId)),
                     parameter);
 
                 modelBuilder.Entity(entityType.ClrType).HasQueryFilter(filter);

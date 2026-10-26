@@ -29,6 +29,7 @@ public class AuthController : ControllerBase
         CancellationToken cancellationToken)
     {
         var user = await _context.Users
+            .IgnoreQueryFilters()
             .AsNoTracking()
             .FirstOrDefaultAsync(u => u.Email == request.Email, cancellationToken);
 

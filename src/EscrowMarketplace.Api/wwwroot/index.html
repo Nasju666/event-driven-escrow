@@ -896,10 +896,16 @@
       try {
         const res = await fetch(`${API_BASE}/api/Auth/token`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: { 
+            'Content-Type': 'application/json',
+            'X-Tenant-Id': TENANT_ID
+          },
           body: JSON.stringify({ email: currentUser.email })
         });
-        if (!res.ok) throw new Error('Failed to obtain token');
+        if (!res.ok) {
+          const errBody = await res.text();
+          throw new Error(`Failed to obtain token (${res.status}): ${errBody}`);
+        }
         const data = await res.json();
         jwtToken = data.token;
         logTelemetry('Auth', `JWT issued for ${currentUser.email} (expires: ${new Date(data.expiresAtUtc).toLocaleTimeString()})`);
@@ -911,14 +917,23 @@
     // Connect to SignalR
     async function connectSignalR() {
       if (hubConnection) {
-        await hubConnection.stop();
+        try { await hubConnection.stop(); } catch (e) {}
       }
 
       const statusPill = document.getElementById('signalrStatus');
       const statusText = document.getElementById('signalrText');
 
+      if (!jwtToken) {
+        statusPill.className = 'signalr-pill disconnected';
+        statusText.textContent = 'Token Missing';
+        logTelemetry('Error', 'SignalR connect aborted: No JWT token present');
+        return;
+      }
+
       hubConnection = new signalR.HubConnectionBuilder()
-        .withUrl(`${API_BASE}/hubs/marketplace?access_token=${jwtToken}&tenant_id=${TENANT_ID}`)
+        .withUrl(`${API_BASE}/hubs/marketplace?tenant_id=${TENANT_ID}`, {
+          accessTokenFactory: () => jwtToken
+        })
         .withAutomaticReconnect()
         .configureLogging(signalR.LogLevel.Warning)
         .build();

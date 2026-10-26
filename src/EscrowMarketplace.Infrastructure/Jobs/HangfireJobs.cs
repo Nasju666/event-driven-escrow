@@ -77,6 +77,7 @@ public class EscrowTimeoutCleanupJob
 
         var now = DateTimeOffset.UtcNow;
         var expiredHolds = await _context.EscrowAccounts
+            .IgnoreQueryFilters()
             .Include(e => e.Booking)
             .Where(e => e.Status == EscrowStatus.PendingAuthorization 
                      && e.CreatedAt < now.AddMinutes(-30))
