@@ -1,0 +1,26 @@
+## Visual Studio / .NET Core
+[Bb]in/
+[Oo]bj/
+[Tt]est[Rr]esults/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+.vs/
+.idea/
+.vscode/
+
+## Rider
+.idea/
+*.sln.iml
+
+## OS Files
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+.DS_Store
+
+## Logs
+logs/
+*.log

@@ -1,0 +1,6 @@
+@EscrowMarketplace.Api_HostAddress = http://localhost:5090
+
+GET {{EscrowMarketplace.Api_HostAddress}}/weatherforecast/
+Accept: application/json
+
+###

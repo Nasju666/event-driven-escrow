@@ -1,0 +1,11 @@
+**/.git
+**/.vs
+**/bin
+**/obj
+**/TestResults
+**/*.user
+**/*.suo
+**/*.userosscache
+**/*.sln.docstates
+.idea/
+.vscode/
