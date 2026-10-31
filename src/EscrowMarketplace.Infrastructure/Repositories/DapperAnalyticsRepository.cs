@@ -22,13 +22,15 @@ public class DapperAnalyticsRepository : IAnalyticsRepository
     {
         var connection = _context.Database.GetDbConnection();
 
+        // EscrowStatus: 2 = Funded, 3 = Settled, 4 = Refunded, 5 = Disputed.
+        // Money is actually held while Funded or Disputed (Authorized is a transient step).
         const string sql = @"
-            SELECT 
-                COALESCE(SUM(CASE WHEN e.""Status"" IN (1, 2) THEN e.""TotalAmount"" ELSE 0 END), 0) AS TotalHeldInEscrow,
+            SELECT
+                COALESCE(SUM(CASE WHEN e.""Status"" IN (2, 5) THEN e.""TotalAmount"" ELSE 0 END), 0) AS TotalHeldInEscrow,
                 COALESCE(SUM(CASE WHEN e.""Status"" = 3 THEN e.""ProviderPayoutAmount"" ELSE 0 END), 0) AS TotalDisbursedToProviders,
                 COALESCE(SUM(CASE WHEN e.""Status"" = 3 THEN e.""PlatformCommissionAmount"" ELSE 0 END), 0) AS TotalPlatformFeesCaptured,
                 COALESCE(SUM(CASE WHEN e.""Status"" = 4 THEN e.""TotalAmount"" ELSE 0 END), 0) AS TotalRefundedToBuyers,
-                COUNT(CASE WHEN e.""Status"" IN (1, 2) THEN 1 END) AS ActiveEscrowHoldsCount,
+                COUNT(CASE WHEN e.""Status"" IN (2, 5) THEN 1 END) AS ActiveEscrowHoldsCount,
                 COUNT(CASE WHEN e.""Status"" = 3 THEN 1 END) AS SettledBookingsCount,
                 COUNT(CASE WHEN e.""Status"" = 5 THEN 1 END) AS ActiveDisputesCount
             FROM ""EscrowAccounts"" e

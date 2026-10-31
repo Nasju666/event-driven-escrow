@@ -1,11 +1,15 @@
 using EscrowMarketplace.Application.Common.Interfaces;
-using EscrowMarketplace.Domain.Enums;
 using EscrowMarketplace.Infrastructure.Persistence;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging;
 
 namespace EscrowMarketplace.Infrastructure.Jobs;
 
+/// <summary>
+/// Nightly ledger reconciliation per tenant: a calendar-style batch job, which is what Hangfire is
+/// good at. Per-booking deadlines (payment, provider response, auto-release) are NOT polled here;
+/// the escrow saga schedules an exact timeout message for each one.
+/// </summary>
 public class LedgerReconciliationJob
 {
     private readonly MarketplaceDbContext _context;
@@ -24,26 +28,20 @@ public class LedgerReconciliationJob
 
     public async Task RunDailyReconciliationAsync(CancellationToken cancellationToken = default)
     {
-        _logger.LogInformation("Starting scheduled Hangfire Ledger Reconciliation Job...");
+        _logger.LogInformation("Starting nightly ledger reconciliation...");
 
-        var tenants = await _context.Tenants.Where(t => t.IsActive).ToListAsync(cancellationToken);
+        var tenants = await _context.Tenants.AsNoTracking().Where(t => t.IsActive).ToListAsync(cancellationToken);
         var now = DateTimeOffset.UtcNow;
-        var yesterday = now.AddDays(-1);
 
         foreach (var tenant in tenants)
         {
             try
             {
-                var summary = await _analyticsRepository.GetLedgerReconciliationAsync(tenant.Id, yesterday, now, cancellationToken);
+                var s = await _analyticsRepository.GetLedgerReconciliationAsync(tenant.Id, now.AddDays(-1), now, cancellationToken);
                 _logger.LogInformation(
-                    "Tenant [{TenantName}] Ledger: Active Holds: {HoldsCount} (${Held}), Settled: {SettledCount} (Disbursed: ${Disbursed}, Fees: ${Fees}), Disputes: {Disputes}",
-                    tenant.Name,
-                    summary.ActiveEscrowHoldsCount,
-                    summary.TotalHeldInEscrow,
-                    summary.SettledBookingsCount,
-                    summary.TotalDisbursedToProviders,
-                    summary.TotalPlatformFeesCaptured,
-                    summary.ActiveDisputesCount);
+                    "Tenant {Tenant}: held {Held} across {Holds} escrows, disbursed {Disbursed}, fees {Fees}, refunded {Refunded}, open disputes {Disputes}",
+                    tenant.Name, s.TotalHeldInEscrow, s.ActiveEscrowHoldsCount, s.TotalDisbursedToProviders,
+                    s.TotalPlatformFeesCaptured, s.TotalRefundedToBuyers, s.ActiveDisputesCount);
             }
             catch (Exception ex)
             {
@@ -51,54 +49,6 @@ public class LedgerReconciliationJob
             }
         }
 
-        _logger.LogInformation("Completed Hangfire Ledger Reconciliation Job.");
-    }
-}
-
-public class EscrowTimeoutCleanupJob
-{
-    private readonly MarketplaceDbContext _context;
-    private readonly IBookingNotifier _notifier;
-    private readonly ILogger<EscrowTimeoutCleanupJob> _logger;
-
-    public EscrowTimeoutCleanupJob(
-        MarketplaceDbContext context,
-        IBookingNotifier notifier,
-        ILogger<EscrowTimeoutCleanupJob> logger)
-    {
-        _context = context;
-        _notifier = notifier;
-        _logger = logger;
-    }
-
-    public async Task ReleaseExpiredHoldsAsync(CancellationToken cancellationToken = default)
-    {
-        _logger.LogInformation("Running Escrow Timeout Cleanup Job...");
-
-        var now = DateTimeOffset.UtcNow;
-        var expiredHolds = await _context.EscrowAccounts
-            .IgnoreQueryFilters()
-            .Include(e => e.Booking)
-            .Where(e => e.Status == EscrowStatus.PendingAuthorization 
-                     && e.CreatedAt < now.AddMinutes(-30))
-            .ToListAsync(cancellationToken);
-
-        foreach (var escrow in expiredHolds)
-        {
-            _logger.LogInformation("Hold expired for Booking {BookingId}. Auto-cancelling hold.", escrow.BookingId);
-            if (escrow.Booking != null && escrow.Booking.Status == BookingStatus.Held)
-            {
-                escrow.Booking.Cancel();
-            }
-
-            await _notifier.NotifyStatusChangedAsync(
-                escrow.TenantId, escrow.BookingId, "Expired", "Payment authorization timed out. Slot released.", cancellationToken);
-        }
-
-        if (expiredHolds.Count > 0)
-        {
-            await _context.SaveChangesAsync(cancellationToken);
-            _logger.LogInformation("Auto-released {Count} expired booking holds.", expiredHolds.Count);
-        }
+        _logger.LogInformation("Nightly ledger reconciliation finished.");
     }
 }

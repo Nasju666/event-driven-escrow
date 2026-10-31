@@ -25,7 +25,7 @@ public class GlobalExceptionMiddleware
         {
             await _next(context);
         }
-        catch (Exception ex)
+        catch (Exception ex) when (!context.Response.HasStarted)
         {
             await HandleExceptionAsync(context, ex);
         }
@@ -87,7 +87,26 @@ public class GlobalExceptionMiddleware
                     .ToDictionary(g => g.Key, g => g.Select(e => e.ErrorMessage).ToArray());
                 break;
 
-            // 5. Entity Not Found
+            // 5. Authenticated but not allowed (e.g. a buyer trying to confirm their own booking)
+            case ForbiddenAccessException forbidden:
+                _logger.LogWarning("Forbidden: {Message}", forbidden.Message);
+                response.StatusCode = (int)HttpStatusCode.Forbidden;
+                problemDetails.Status = (int)HttpStatusCode.Forbidden;
+                problemDetails.Title = "Forbidden";
+                problemDetails.Detail = forbidden.Message;
+                problemDetails.Type = "https://marketplace.local/errors/forbidden";
+                break;
+
+            // 6. Wallet can't cover the payment
+            case InsufficientFundsException funds:
+                response.StatusCode = (int)HttpStatusCode.UnprocessableEntity;
+                problemDetails.Status = (int)HttpStatusCode.UnprocessableEntity;
+                problemDetails.Title = "Insufficient Funds";
+                problemDetails.Detail = funds.Message;
+                problemDetails.Type = "https://marketplace.local/errors/insufficient-funds";
+                break;
+
+            // 7. Entity Not Found
             case NotFoundException nfEx:
                 _logger.LogWarning(exception, "Resource not found: {Message}", nfEx.Message);
                 response.StatusCode = (int)HttpStatusCode.NotFound;

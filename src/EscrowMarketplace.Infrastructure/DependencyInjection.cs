@@ -1,6 +1,8 @@
 using EscrowMarketplace.Application.Common.Interfaces;
+using EscrowMarketplace.Application.Common.Settings;
 using EscrowMarketplace.Infrastructure.Consumers;
 using EscrowMarketplace.Infrastructure.Jobs;
+using EscrowMarketplace.Infrastructure.Messaging;
 using EscrowMarketplace.Infrastructure.Persistence;
 using EscrowMarketplace.Infrastructure.Repositories;
 using EscrowMarketplace.Infrastructure.Saga;
@@ -20,17 +22,20 @@ public static class DependencyInjection
         this IServiceCollection services,
         IConfiguration configuration)
     {
-        var connectionString = configuration.GetConnectionString("DefaultConnection") 
-            ?? "Host=localhost;Port=5432;Database=EscrowMarketplaceDb;Username=postgres;Password=postgres";
-
         var useInMemory = configuration.GetValue<bool>("UseInMemoryDatabase");
+        var connectionString = configuration.GetConnectionString("DefaultConnection");
 
-        // 1. EF Core DbContext with Npgsql & btree_gist
+        if (!useInMemory && string.IsNullOrWhiteSpace(connectionString))
+            throw new InvalidOperationException("ConnectionStrings:DefaultConnection is required unless UseInMemoryDatabase is true.");
+
+        services.Configure<EscrowWorkflowOptions>(configuration.GetSection(EscrowWorkflowOptions.SectionName));
+
+        // ── 1. EF Core ──
         services.AddDbContext<MarketplaceDbContext>(options =>
         {
             if (useInMemory)
             {
-                options.UseInMemoryDatabase("EscrowMarketplaceTestDb");
+                options.UseInMemoryDatabase("EscrowMarketplaceDemoDb");
                 options.ConfigureWarnings(w => w.Ignore(Microsoft.EntityFrameworkCore.Diagnostics.InMemoryEventId.TransactionIgnoredWarning));
             }
             else
@@ -47,81 +52,76 @@ public static class DependencyInjection
         services.AddScoped<IReadDbContext, ReadDbContext>();
         services.AddScoped<MarketplaceDbContextInitializer>();
 
-        // 2. Multi-tenant Context
+        // ── 2. Request / message context (who and which tenant) ──
         services.AddScoped<CurrentTenantService>();
         services.AddScoped<ICurrentTenantService>(sp => sp.GetRequiredService<CurrentTenantService>());
+        services.AddScoped<CurrentActor>();
+        services.AddScoped<ICurrentActor>(sp => sp.GetRequiredService<CurrentActor>());
 
-        // 3. Dapper Analytics & Core Services
         services.AddScoped<IAnalyticsRepository, DapperAnalyticsRepository>();
-        services.AddScoped<IEscrowPaymentGateway, MockEscrowPaymentGateway>();
+        services.AddScoped<IEscrowWorkflowReader, EscrowWorkflowReader>();
         services.AddScoped<IBookingNotifier, BookingNotifier>();
 
-        // 4. Redis Distributed Cache
-        var redisConn = configuration.GetConnectionString("Redis") ?? "localhost:6379";
-        services.AddStackExchangeRedisCache(options =>
+        // Resolved lazily by MarketplaceDbContext.SaveChangesAsync. The scoped IPublishEndpoint is
+        // the EF bus outbox in web requests and the consume context (consumer outbox) in consumers.
+        services.AddScoped<IDomainEventDispatcher>(sp =>
+            new MassTransitDomainEventDispatcher(sp.GetRequiredService<IPublishEndpoint>(), usesTransactionalOutbox: !useInMemory));
+
+        // ── 3. MassTransit: outbox, saga, consumers, delayed scheduling ──
+        services.AddMassTransit(bus =>
         {
-            options.Configuration = redisConn;
-            options.InstanceName = "EscrowMarketplace:";
-        });
-        services.AddSingleton<ICacheService, RedisCacheService>();
+            bus.SetKebabCaseEndpointNameFormatter();
 
-        // 5. MassTransit with Transactional EF Core Outbox & Saga State Machine
-        services.AddMassTransit(busConfig =>
-        {
-            busConfig.SetKebabCaseEndpointNameFormatter();
+            // Saga timeouts are scheduled with the transport's delayed delivery
+            // (RabbitMQ delayed-message-exchange plugin, or the in-memory transport).
+            bus.AddDelayedMessageScheduler();
 
-            // Register consumers
-            busConfig.AddConsumer<EscrowStatusChangedSignalRConsumer>();
-            busConfig.AddConsumer<BookingEventAuditConsumer>();
+            bus.AddConsumer<WorkflowCommandConsumer>();
+            bus.AddConsumer<RealtimeNotificationConsumer>();
 
-            // Register Escrow Saga State Machine
+            // One message at a time on the saga endpoint: retries happen in place, so events are
+            // applied in the order the outbox delivered them. At higher volume you would partition
+            // by BookingId instead (UsePartitioner) to keep per-booking ordering with parallelism.
+            var saga = bus.AddSagaStateMachine<EscrowStateMachine, EscrowBookingState>()
+                .Endpoint(e => e.ConcurrentMessageLimit = 1);
             if (useInMemory)
             {
-                busConfig.AddSagaStateMachine<EscrowStateMachine, EscrowBookingState>()
-                    .InMemoryRepository();
+                saga.InMemoryRepository();
             }
             else
             {
-                busConfig.AddSagaStateMachine<EscrowStateMachine, EscrowBookingState>()
-                    .EntityFrameworkRepository(r =>
-                    {
-                        r.ExistingDbContext<MarketplaceDbContext>();
-                        r.UsePostgres();
-                        r.ConcurrencyMode = ConcurrencyMode.Optimistic;
-                    });
+                saga.EntityFrameworkRepository(r =>
+                {
+                    r.ConcurrencyMode = ConcurrencyMode.Optimistic;
+                    r.ExistingDbContext<MarketplaceDbContext>();
+                    r.UsePostgres();
+                });
 
-                // Register Transactional Outbox (Postgres only)
-                busConfig.AddEntityFrameworkOutbox<MarketplaceDbContext>(o =>
+                bus.AddEntityFrameworkOutbox<MarketplaceDbContext>(o =>
                 {
                     o.UsePostgres();
-                    o.UseBusOutbox(bo =>
-                    {
-                        bo.MessageDeliveryLimit = 100;
-                        bo.MessageDeliveryTimeout = TimeSpan.FromSeconds(45);
-                    });
-                    o.QueryDelay = TimeSpan.FromSeconds(5);
+                    o.UseBusOutbox();
+                    o.QueryDelay = TimeSpan.FromSeconds(1);
+                    o.DuplicateDetectionWindow = TimeSpan.FromMinutes(30);
                 });
             }
 
-            // Endpoint callbacks configuring retry and Outbox
-            busConfig.AddConfigureEndpointsCallback((context, name, cfg) =>
+            bus.AddConfigureEndpointsCallback((context, name, cfg) =>
             {
-                cfg.UseMessageRetry(r => r.Immediate(5));
-                if (!useInMemory)
-                {
-                    cfg.UseEntityFrameworkOutbox<MarketplaceDbContext>(context);
-                }
-                else
-                {
+                // Covers optimistic-concurrency conflicts on the saga row and the short window
+                // where an event can overtake the BookingSlotReservedEvent that creates the saga.
+                cfg.UseMessageRetry(r => r.Intervals(100, 500, 1000, 2000, 5000));
+
+                if (useInMemory)
                     cfg.UseInMemoryOutbox(context);
-                }
+                else
+                    cfg.UseEntityFrameworkOutbox<MarketplaceDbContext>(context);
             });
 
-            // Transport: RabbitMQ if configured, else In-Memory with full outbox features
             var rabbitMqHost = configuration["RabbitMQ:Host"];
-            if (!string.IsNullOrEmpty(rabbitMqHost))
+            if (!string.IsNullOrWhiteSpace(rabbitMqHost))
             {
-                busConfig.UsingRabbitMq((context, cfg) =>
+                bus.UsingRabbitMq((context, cfg) =>
                 {
                     cfg.Host(rabbitMqHost, h =>
                     {
@@ -129,32 +129,30 @@ public static class DependencyInjection
                         h.Password(configuration["RabbitMQ:Password"] ?? "guest");
                     });
 
+                    cfg.UseDelayedMessageScheduler();
                     cfg.ConfigureEndpoints(context);
                 });
             }
             else
             {
-                busConfig.UsingInMemory((context, cfg) =>
+                bus.UsingInMemory((context, cfg) =>
                 {
+                    cfg.UseDelayedMessageScheduler();
                     cfg.ConfigureEndpoints(context);
                 });
             }
         });
 
-        // 6. SignalR
-        var signalR = services.AddSignalR(options =>
-        {
-            options.EnableDetailedErrors = true;
-        });
-
+        // ── 4. SignalR (optional Redis backplane for multiple API instances) ──
+        var signalR = services.AddSignalR();
         var signalRRedis = configuration["SignalR:Redis"];
-        if (!string.IsNullOrEmpty(signalRRedis))
+        if (!string.IsNullOrWhiteSpace(signalRRedis))
         {
             signalR.AddStackExchangeRedis(signalRRedis);
         }
 
-        // 7. Hangfire Background Jobs
-        if (!configuration.GetValue<bool>("UseInMemoryDatabase"))
+        // ── 5. Hangfire: nightly reconciliation only ──
+        if (IsHangfireEnabled(configuration))
         {
             services.AddHangfire(config =>
             {
@@ -163,15 +161,14 @@ public static class DependencyInjection
                       .UseRecommendedSerializerSettings()
                       .UsePostgreSqlStorage(c => c.UseNpgsqlConnection(connectionString));
             });
-            services.AddHangfireServer(opt =>
-            {
-                opt.WorkerCount = Math.Max(Environment.ProcessorCount * 2, 4);
-            });
+            services.AddHangfireServer();
         }
 
         services.AddScoped<LedgerReconciliationJob>();
-        services.AddScoped<EscrowTimeoutCleanupJob>();
 
         return services;
     }
+
+    public static bool IsHangfireEnabled(IConfiguration configuration) =>
+        !configuration.GetValue<bool>("UseInMemoryDatabase") && configuration.GetValue("Hangfire:Enabled", true);
 }

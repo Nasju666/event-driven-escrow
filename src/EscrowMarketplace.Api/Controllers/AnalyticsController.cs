@@ -1,46 +1,42 @@
+using EscrowMarketplace.Api.Authentication;
 using EscrowMarketplace.Application.Common.Interfaces;
+using EscrowMarketplace.Application.Common.Security;
+using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.RateLimiting;
 
 namespace EscrowMarketplace.Api.Controllers;
 
+/// <summary>Tenant-wide money figures (Dapper aggregates over the escrow table). Admins only.</summary>
 [ApiController]
-[Route("api/[controller]")]
+[Route("api/analytics")]
+[Authorize(Policy = Policies.Admin)]
+[EnableRateLimiting(RateLimitPolicies.PerUser)]
 public class AnalyticsController : ControllerBase
 {
     private readonly IAnalyticsRepository _analyticsRepository;
     private readonly ICurrentTenantService _tenantService;
 
-    public AnalyticsController(
-        IAnalyticsRepository analyticsRepository,
-        ICurrentTenantService tenantService)
+    public AnalyticsController(IAnalyticsRepository analyticsRepository, ICurrentTenantService tenantService)
     {
         _analyticsRepository = analyticsRepository;
         _tenantService = tenantService;
     }
 
     [HttpGet("reconciliation")]
-    [ProducesResponseType(typeof(LedgerReconciliationSummary), StatusCodes.Status200OK)]
     public async Task<ActionResult<LedgerReconciliationSummary>> GetReconciliation(
-        [FromQuery] DateTimeOffset? fromUtc,
-        [FromQuery] DateTimeOffset? toUtc,
-        CancellationToken cancellationToken = default)
+        [FromQuery] DateTimeOffset? fromUtc, [FromQuery] DateTimeOffset? toUtc, CancellationToken ct = default)
     {
-        var tenantId = _tenantService.TenantId ?? Guid.Parse("11111111-1111-1111-1111-111111111111");
-        var from = fromUtc ?? DateTimeOffset.UtcNow.AddMonths(-1);
+        var tenantId = _tenantService.RequireTenantId();
+        var from = fromUtc ?? DateTimeOffset.UtcNow.AddDays(-30);
         var to = toUtc ?? DateTimeOffset.UtcNow.AddDays(1);
-
-        var summary = await _analyticsRepository.GetLedgerReconciliationAsync(tenantId, from, to, cancellationToken);
-        return Ok(summary);
+        return Ok(await _analyticsRepository.GetLedgerReconciliationAsync(tenantId, from, to, ct));
     }
 
     [HttpGet("trends")]
-    [ProducesResponseType(typeof(IReadOnlyList<DailySettlementMetric>), StatusCodes.Status200OK)]
-    public async Task<ActionResult<IReadOnlyList<DailySettlementMetric>>> GetTrends(
-        [FromQuery] int days = 30,
-        CancellationToken cancellationToken = default)
+    public async Task<ActionResult<IReadOnlyList<DailySettlementMetric>>> GetTrends([FromQuery] int days = 30, CancellationToken ct = default)
     {
-        var tenantId = _tenantService.TenantId ?? Guid.Parse("11111111-1111-1111-1111-111111111111");
-        var trends = await _analyticsRepository.GetDailySettlementTrendsAsync(tenantId, days, cancellationToken);
-        return Ok(trends);
+        var tenantId = _tenantService.RequireTenantId();
+        return Ok(await _analyticsRepository.GetDailySettlementTrendsAsync(tenantId, Math.Clamp(days, 1, 365), ct));
     }
 }

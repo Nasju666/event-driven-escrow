@@ -1,10 +1,21 @@
+using System.Security.Claims;
+using System.Text.Json;
 using EscrowMarketplace.Application.Common.Interfaces;
-using EscrowMarketplace.Domain.Entities;
+using EscrowMarketplace.Domain.Enums;
 using EscrowMarketplace.Infrastructure.Persistence;
+using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
 
 namespace EscrowMarketplace.Api.Middleware;
 
+/// <summary>
+/// Resolves the tenant and the acting user for the request from the VALIDATED JWT only.
+/// Client-supplied headers such as X-Tenant-Id are deliberately ignored: trusting them let any
+/// user read another tenant's data. Runs after UseAuthentication/UseAuthorization, so
+/// context.User is populated.
+/// Anonymous requests (login, docs, static files) pass through with no tenant set, and the
+/// fail-closed query filters then return no tenant data.
+/// </summary>
 public class TenantMiddleware
 {
     private readonly RequestDelegate _next;
@@ -16,59 +27,53 @@ public class TenantMiddleware
         _logger = logger;
     }
 
-    public async Task InvokeAsync(HttpContext context, ICurrentTenantService tenantService, MarketplaceDbContext dbContext)
+    public async Task InvokeAsync(
+        HttpContext context,
+        ICurrentTenantService tenantService,
+        ICurrentActor actor,
+        MarketplaceDbContext dbContext)
     {
-        var path = context.Request.Path.Value?.ToLowerInvariant() ?? string.Empty;
+        var user = context.User;
 
-        // Skip tenant check for swagger, scalar, openapi, health endpoints, root, or static files
-        if (path.StartsWith("/swagger") || path.StartsWith("/scalar") || path.StartsWith("/openapi") || path.StartsWith("/health") || path.StartsWith("/hangfire") || path == "/" || path.Contains("."))
+        if (user.Identity?.IsAuthenticated == true)
         {
-            await _next(context);
-            return;
-        }
+            var userIdValue = user.FindFirstValue(ClaimTypes.NameIdentifier) ?? user.FindFirstValue("sub");
+            var tenantIdValue = user.FindFirstValue("tenant_id");
+            var roleValue = user.FindFirstValue(ClaimTypes.Role);
 
-        string? tenantHeader = context.Request.Headers["X-Tenant-Id"].FirstOrDefault();
-
-        // Also allow query string for WebSocket handshakes / testing
-        if (string.IsNullOrEmpty(tenantHeader))
-        {
-            tenantHeader = context.Request.Query["X-Tenant-Id"].FirstOrDefault()
-                ?? context.Request.Query["tenant_id"].FirstOrDefault();
-        }
-
-        // Also check JWT claim if present
-        if (string.IsNullOrEmpty(tenantHeader) && context.User.Identity?.IsAuthenticated == true)
-        {
-            tenantHeader = context.User.FindFirst("tenant_id")?.Value;
-        }
-
-        if (!string.IsNullOrEmpty(tenantHeader))
-        {
-            if (Guid.TryParse(tenantHeader, out var tenantGuid))
+            if (!Guid.TryParse(userIdValue, out var userId)
+                || !Guid.TryParse(tenantIdValue, out var tenantId)
+                || !Enum.TryParse<UserRole>(roleValue, out var role))
             {
-                var tenant = await dbContext.Tenants
-                    .AsNoTracking()
-                    .FirstOrDefaultAsync(t => t.Id == tenantGuid && t.IsActive);
-
-                if (tenant != null)
-                {
-                    tenantService.SetTenant(tenant.Id, tenant.Identifier);
-                }
+                _logger.LogWarning("Rejected token with missing or malformed user/tenant/role claims.");
+                await WriteProblem(context, StatusCodes.Status401Unauthorized, "Invalid token", "The access token is missing required claims.");
+                return;
             }
-            else
+
+            var tenant = await dbContext.Tenants
+                .AsNoTracking()
+                .Where(t => t.Id == tenantId && t.IsActive)
+                .Select(t => new { t.Id, t.Identifier })
+                .FirstOrDefaultAsync(context.RequestAborted);
+
+            if (tenant is null)
             {
-                // Fallback to identifier search (e.g. "apex-studios")
-                var tenant = await dbContext.Tenants
-                    .AsNoTracking()
-                    .FirstOrDefaultAsync(t => t.Identifier == tenantHeader && t.IsActive);
-
-                if (tenant != null)
-                {
-                    tenantService.SetTenant(tenant.Id, tenant.Identifier);
-                }
+                await WriteProblem(context, StatusCodes.Status403Forbidden, "Tenant unavailable", "The tenant in this token does not exist or is inactive.");
+                return;
             }
+
+            tenantService.SetTenant(tenant.Id, tenant.Identifier);
+            actor.SetUser(userId, role);
         }
 
         await _next(context);
+    }
+
+    private static async Task WriteProblem(HttpContext context, int status, string title, string detail)
+    {
+        context.Response.StatusCode = status;
+        context.Response.ContentType = "application/problem+json";
+        var problem = new ProblemDetails { Status = status, Title = title, Detail = detail, Instance = context.Request.Path };
+        await context.Response.WriteAsync(JsonSerializer.Serialize(problem));
     }
 }

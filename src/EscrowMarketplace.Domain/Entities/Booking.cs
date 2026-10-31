@@ -1,10 +1,17 @@
 using EscrowMarketplace.Domain.Common;
 using EscrowMarketplace.Domain.Enums;
+using EscrowMarketplace.Domain.Events;
 using EscrowMarketplace.Domain.Exceptions;
 using EscrowMarketplace.Domain.ValueObjects;
 
 namespace EscrowMarketplace.Domain.Entities;
 
+/// <summary>
+/// Booking aggregate. Owns the reservation lifecycle:
+/// PendingPayment → Held → Confirmed → (InService) → Completed → Settled,
+/// with exits to Cancelled / Expired / Disputed / Refunded.
+/// Every transition raises a domain event that the escrow saga reacts to.
+/// </summary>
 public class Booking : BaseEntity, ITenantEntity, IAuditableEntity
 {
     public Guid TenantId { get; set; }
@@ -17,10 +24,11 @@ public class Booking : BaseEntity, ITenantEntity, IAuditableEntity
     public string Currency { get; set; } = "USD";
     public BookingStatus Status { get; set; } = BookingStatus.PendingPayment;
 
-    /// <summary>
-    /// PostgreSQL xmin system column mapped concurrency token.
-    /// Prevents lost updates when modifying active bookings.
-    /// </summary>
+    public DateTimeOffset PaymentDueUtc { get; set; }
+    public DateTimeOffset? ProviderResponseDueUtc { get; set; }
+    public string? CancellationReason { get; set; }
+
+    /// <summary>PostgreSQL xmin concurrency token. Prevents lost updates on concurrent transitions.</summary>
     public uint RowVersion { get; set; }
 
     // Navigations
@@ -29,59 +37,104 @@ public class Booking : BaseEntity, ITenantEntity, IAuditableEntity
     public User? Provider { get; set; }
     public EscrowAccount? EscrowAccount { get; set; }
 
-    public void MarkHeld()
+    public static Booking Reserve(
+        Guid tenantId,
+        BookableResource resource,
+        Guid buyerId,
+        TimeRange period,
+        DateTimeOffset paymentDueUtc)
     {
-        if (Status != BookingStatus.PendingPayment)
-            throw new InvalidStateTransitionException(nameof(Booking), Status.ToString(), nameof(BookingStatus.Held));
+        if (resource.ProviderId == buyerId)
+            throw new DomainException("Providers cannot book their own resources.");
 
-        Status = BookingStatus.Held;
+        var hours = (decimal)period.Duration.TotalHours;
+        var total = Math.Round(hours * resource.HourlyRate, 2, MidpointRounding.AwayFromZero);
+        if (total <= 0)
+            throw new DomainException("Booking total must be greater than zero.");
+
+        var booking = new Booking
+        {
+            Id = Guid.NewGuid(),
+            TenantId = tenantId,
+            ResourceId = resource.Id,
+            BuyerId = buyerId,
+            ProviderId = resource.ProviderId,
+            Period = period,
+            TotalAmount = total,
+            Currency = resource.Currency,
+            Status = BookingStatus.PendingPayment,
+            PaymentDueUtc = paymentDueUtc
+        };
+
+        booking.AddDomainEvent(new BookingSlotReservedEvent(
+            booking.Id, tenantId, resource.Id, buyerId, resource.ProviderId,
+            period.Start, period.End, total, resource.Currency, paymentDueUtc));
+
+        return booking;
+    }
+
+    public bool IsParticipant(Guid userId) => BuyerId == userId || ProviderId == userId;
+
+    public void MarkPaid(DateTimeOffset providerResponseDueUtc)
+    {
+        TransitionTo(BookingStatus.Held, BookingStatus.PendingPayment);
+        ProviderResponseDueUtc = providerResponseDueUtc;
+        AddDomainEvent(new BookingPaidEvent(Id, TenantId, providerResponseDueUtc));
     }
 
     public void Confirm()
     {
-        if (Status != BookingStatus.Held && Status != BookingStatus.PendingPayment)
-            throw new InvalidStateTransitionException(nameof(Booking), Status.ToString(), nameof(BookingStatus.Confirmed));
-
-        Status = BookingStatus.Confirmed;
+        TransitionTo(BookingStatus.Confirmed, BookingStatus.Held);
+        AddDomainEvent(new ProviderConfirmedBookingEvent(Id, TenantId, ProviderId));
     }
 
     public void StartService()
     {
-        if (Status != BookingStatus.Confirmed)
-            throw new InvalidStateTransitionException(nameof(Booking), Status.ToString(), nameof(BookingStatus.InService));
-
-        Status = BookingStatus.InService;
+        TransitionTo(BookingStatus.InService, BookingStatus.Confirmed);
     }
 
-    public void Complete()
+    public void Complete(DateTimeOffset inspectionDeadlineUtc)
     {
-        if (Status != BookingStatus.Held && Status != BookingStatus.Confirmed && Status != BookingStatus.InService)
-            throw new InvalidStateTransitionException(nameof(Booking), Status.ToString(), nameof(BookingStatus.Completed));
-
-        Status = BookingStatus.Completed;
+        TransitionTo(BookingStatus.Completed, BookingStatus.Confirmed, BookingStatus.InService);
+        AddDomainEvent(new ServiceCompletedEvent(Id, TenantId, inspectionDeadlineUtc));
     }
 
-    public void Cancel()
+    public void Cancel(string reason)
     {
-        if (Status == BookingStatus.Completed || Status == BookingStatus.Refunded)
-            throw new InvalidStateTransitionException(nameof(Booking), Status.ToString(), nameof(BookingStatus.Cancelled));
+        TransitionTo(BookingStatus.Cancelled,
+            BookingStatus.PendingPayment, BookingStatus.Held, BookingStatus.Confirmed);
+        CancellationReason = reason;
+        AddDomainEvent(new BookingCancelledEvent(Id, TenantId, ResourceId, reason));
+    }
 
-        Status = BookingStatus.Cancelled;
+    public void Expire()
+    {
+        TransitionTo(BookingStatus.Expired, BookingStatus.PendingPayment);
+        CancellationReason = "Payment window elapsed.";
+        AddDomainEvent(new BookingExpiredEvent(Id, TenantId, ResourceId));
     }
 
     public void MarkDisputed()
     {
-        if (Status != BookingStatus.Held && Status != BookingStatus.Confirmed && Status != BookingStatus.InService && Status != BookingStatus.Completed)
-            throw new InvalidStateTransitionException(nameof(Booking), Status.ToString(), nameof(BookingStatus.Disputed));
-
-        Status = BookingStatus.Disputed;
+        TransitionTo(BookingStatus.Disputed,
+            BookingStatus.Confirmed, BookingStatus.InService, BookingStatus.Completed);
     }
 
-    public void Refund()
+    public void MarkRefunded()
     {
-        if (Status != BookingStatus.Cancelled && Status != BookingStatus.Disputed && Status != BookingStatus.Held)
-            throw new InvalidStateTransitionException(nameof(Booking), Status.ToString(), nameof(BookingStatus.Refunded));
+        TransitionTo(BookingStatus.Refunded, BookingStatus.Cancelled, BookingStatus.Disputed);
+    }
 
-        Status = BookingStatus.Refunded;
+    public void MarkSettled()
+    {
+        TransitionTo(BookingStatus.Settled, BookingStatus.Completed, BookingStatus.Disputed);
+    }
+
+    private void TransitionTo(BookingStatus target, params BookingStatus[] allowedFrom)
+    {
+        if (!allowedFrom.Contains(Status))
+            throw new InvalidStateTransitionException(nameof(Booking), Status.ToString(), target.ToString());
+
+        Status = target;
     }
 }

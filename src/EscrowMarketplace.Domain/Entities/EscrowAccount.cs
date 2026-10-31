@@ -1,9 +1,16 @@
 using EscrowMarketplace.Domain.Common;
 using EscrowMarketplace.Domain.Enums;
+using EscrowMarketplace.Domain.Events;
 using EscrowMarketplace.Domain.Exceptions;
 
 namespace EscrowMarketplace.Domain.Entities;
 
+/// <summary>
+/// Escrow aggregate. Holds the buyer's money between payment and settlement and records
+/// every movement in an append-only ledger:
+/// PendingAuthorization → Authorized → Funded → Settled | Refunded (via Disputed if contested),
+/// or Voided when the booking ends before any money moved.
+/// </summary>
 public class EscrowAccount : BaseEntity, ITenantEntity, IAuditableEntity
 {
     public Guid TenantId { get; set; }
@@ -50,7 +57,7 @@ public class EscrowAccount : BaseEntity, ITenantEntity, IAuditableEntity
         if (commissionPercent < 0 || commissionPercent > 100)
             throw new ArgumentException("Commission percent must be between 0 and 100.", nameof(commissionPercent));
 
-        var commission = Math.Round(totalAmount * (commissionPercent / 100m), 2);
+        var commission = Math.Round(totalAmount * (commissionPercent / 100m), 2, MidpointRounding.AwayFromZero);
         var payout = totalAmount - commission;
 
         return new EscrowAccount
@@ -69,92 +76,91 @@ public class EscrowAccount : BaseEntity, ITenantEntity, IAuditableEntity
         };
     }
 
-    public void MarkAuthorized(string paymentRef)
+    public void Authorize(string paymentReference)
     {
-        if (Status != EscrowStatus.PendingAuthorization)
-            throw new InvalidStateTransitionException(nameof(EscrowAccount), Status.ToString(), nameof(EscrowStatus.Authorized));
-
-        Status = EscrowStatus.Authorized;
-        PaymentReference = paymentRef;
+        TransitionTo(EscrowStatus.Authorized, EscrowStatus.PendingAuthorization);
+        PaymentReference = paymentReference;
         AuthorizedAt = DateTimeOffset.UtcNow;
+        AddDomainEvent(new EscrowFundsAuthorizedEvent(BookingId, TenantId, Id, TotalAmount, paymentReference));
     }
 
-    public void MarkFunded(DateTimeOffset inspectionDeadline)
+    public void Capture()
     {
-        if (Status != EscrowStatus.Authorized && Status != EscrowStatus.PendingAuthorization)
-            throw new InvalidStateTransitionException(nameof(EscrowAccount), Status.ToString(), nameof(EscrowStatus.Funded));
-
-        Status = EscrowStatus.Funded;
+        TransitionTo(EscrowStatus.Funded, EscrowStatus.Authorized);
         FundedAt = DateTimeOffset.UtcNow;
-        InspectionDeadlineUtc = inspectionDeadline;
 
-        // Auto record initial credit ledger entry
-        LedgerEntries.Add(new EscrowLedgerEntry
-        {
-            TenantId = TenantId,
-            EscrowAccountId = Id,
-            EntryType = LedgerEntryType.HoldDeposit,
-            Amount = TotalAmount,
-            Currency = Currency,
-            Description = $"Escrow funds securely deposited by Buyer {BuyerId} for Booking {BookingId}"
-        });
+        AddLedgerEntry(LedgerEntryType.HoldDeposit, TotalAmount,
+            $"Buyer {BuyerId} deposited funds into escrow for booking {BookingId}");
+
+        AddDomainEvent(new EscrowFundsCapturedEvent(BookingId, TenantId, Id, TotalAmount));
     }
 
-    public void ReleasePayout()
+    public void StartInspectionWindow(DateTimeOffset deadlineUtc)
     {
         if (Status != EscrowStatus.Funded)
-            throw new InvalidStateTransitionException(nameof(EscrowAccount), Status.ToString(), nameof(EscrowStatus.Settled));
+            throw new DomainException($"Inspection window can only start on a funded escrow (current: {Status}).");
 
-        Status = EscrowStatus.Settled;
-        SettledAt = DateTimeOffset.UtcNow;
-
-        // Record provider disbursement
-        LedgerEntries.Add(new EscrowLedgerEntry
-        {
-            TenantId = TenantId,
-            EscrowAccountId = Id,
-            EntryType = LedgerEntryType.ProviderPayout,
-            Amount = ProviderPayoutAmount,
-            Currency = Currency,
-            Description = $"Disbursed payout to Provider {ProviderId}"
-        });
-
-        // Record platform commission fee
-        LedgerEntries.Add(new EscrowLedgerEntry
-        {
-            TenantId = TenantId,
-            EscrowAccountId = Id,
-            EntryType = LedgerEntryType.PlatformFee,
-            Amount = PlatformCommissionAmount,
-            Currency = Currency,
-            Description = $"Platform fee captured ({PlatformCommissionPercent}%)"
-        });
-    }
-
-    public void Refund(string reason)
-    {
-        if (Status != EscrowStatus.Funded && Status != EscrowStatus.Authorized && Status != EscrowStatus.Disputed)
-            throw new InvalidStateTransitionException(nameof(EscrowAccount), Status.ToString(), nameof(EscrowStatus.Refunded));
-
-        Status = EscrowStatus.Refunded;
-        RefundedAt = DateTimeOffset.UtcNow;
-
-        LedgerEntries.Add(new EscrowLedgerEntry
-        {
-            TenantId = TenantId,
-            EscrowAccountId = Id,
-            EntryType = LedgerEntryType.RefundToBuyer,
-            Amount = TotalAmount,
-            Currency = Currency,
-            Description = $"Full refund disbursed to Buyer {BuyerId}. Reason: {reason}"
-        });
+        InspectionDeadlineUtc = deadlineUtc;
     }
 
     public void MarkDisputed()
     {
-        if (Status != EscrowStatus.Funded)
-            throw new InvalidStateTransitionException(nameof(EscrowAccount), Status.ToString(), nameof(EscrowStatus.Disputed));
+        TransitionTo(EscrowStatus.Disputed, EscrowStatus.Funded);
+    }
 
-        Status = EscrowStatus.Disputed;
+    /// <summary>Releases the held funds: payout to the provider, commission to the platform.</summary>
+    public void ReleasePayout()
+    {
+        TransitionTo(EscrowStatus.Settled, EscrowStatus.Funded, EscrowStatus.Disputed);
+        SettledAt = DateTimeOffset.UtcNow;
+
+        AddLedgerEntry(LedgerEntryType.ProviderPayout, ProviderPayoutAmount,
+            $"Payout released to provider {ProviderId}");
+        AddLedgerEntry(LedgerEntryType.PlatformFee, PlatformCommissionAmount,
+            $"Platform fee captured ({PlatformCommissionPercent}%)");
+
+        AddDomainEvent(new EscrowPayoutReleasedEvent(
+            BookingId, TenantId, Id, ProviderId, ProviderPayoutAmount, PlatformCommissionAmount));
+    }
+
+    /// <summary>Returns the full held amount to the buyer.</summary>
+    public void Refund(string reason)
+    {
+        TransitionTo(EscrowStatus.Refunded, EscrowStatus.Funded, EscrowStatus.Disputed);
+        RefundedAt = DateTimeOffset.UtcNow;
+
+        AddLedgerEntry(LedgerEntryType.RefundToBuyer, TotalAmount,
+            $"Full refund to buyer {BuyerId}. Reason: {reason}");
+
+        AddDomainEvent(new EscrowRefundedEvent(BookingId, TenantId, Id, BuyerId, TotalAmount, reason));
+    }
+
+    /// <summary>Closes an escrow that never received money. No ledger entry, because nothing moved.</summary>
+    public void Void()
+    {
+        TransitionTo(EscrowStatus.Voided, EscrowStatus.PendingAuthorization, EscrowStatus.Authorized);
+    }
+
+    private void AddLedgerEntry(LedgerEntryType type, decimal amount, string description)
+    {
+        // No Id here: entries reach EF through the navigation, and a preset key would make EF
+        // treat them as existing rows (UPDATE instead of INSERT). EF generates the key on add.
+        LedgerEntries.Add(new EscrowLedgerEntry
+        {
+            TenantId = TenantId,
+            EscrowAccountId = Id,
+            EntryType = type,
+            Amount = amount,
+            Currency = Currency,
+            Description = description
+        });
+    }
+
+    private void TransitionTo(EscrowStatus target, params EscrowStatus[] allowedFrom)
+    {
+        if (!allowedFrom.Contains(Status))
+            throw new InvalidStateTransitionException(nameof(EscrowAccount), Status.ToString(), target.ToString());
+
+        Status = target;
     }
 }

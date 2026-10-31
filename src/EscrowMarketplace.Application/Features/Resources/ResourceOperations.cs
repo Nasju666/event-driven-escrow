@@ -1,15 +1,16 @@
 using EscrowMarketplace.Application.Common.Interfaces;
 using EscrowMarketplace.Application.Common.Models;
+using EscrowMarketplace.Application.Common.Security;
 using EscrowMarketplace.Domain.Entities;
-using EscrowMarketplace.Domain.Exceptions;
+using EscrowMarketplace.Domain.Enums;
 using FluentValidation;
 using MediatR;
 using Microsoft.EntityFrameworkCore;
 
 namespace EscrowMarketplace.Application.Features.Resources.Commands;
 
+/// <summary>A provider lists a new bookable resource. The provider is the authenticated user.</summary>
 public record CreateResourceCommand(
-    Guid ProviderId,
     string Title,
     string Description,
     decimal HourlyRate,
@@ -21,40 +22,41 @@ public class CreateResourceCommandValidator : AbstractValidator<CreateResourceCo
 {
     public CreateResourceCommandValidator()
     {
-        RuleFor(x => x.ProviderId).NotEmpty();
         RuleFor(x => x.Title).NotEmpty().MaximumLength(150);
-        RuleFor(x => x.HourlyRate).GreaterThan(0);
+        RuleFor(x => x.Description).MaximumLength(1000);
+        RuleFor(x => x.HourlyRate).GreaterThan(0).LessThanOrEqualTo(100_000);
+        RuleFor(x => x.Currency).NotEmpty().Length(3);
     }
 }
 
 public class CreateResourceCommandHandler : IRequestHandler<CreateResourceCommand, ResourceDto>
 {
     private readonly IMarketplaceDbContext _context;
-    private readonly ICurrentTenantService _tenantService;
+    private readonly ICurrentTenantService _tenant;
+    private readonly ICurrentActor _actor;
 
-    public CreateResourceCommandHandler(IMarketplaceDbContext context, ICurrentTenantService tenantService)
+    public CreateResourceCommandHandler(IMarketplaceDbContext context, ICurrentTenantService tenant, ICurrentActor actor)
     {
         _context = context;
-        _tenantService = tenantService;
+        _tenant = tenant;
+        _actor = actor;
     }
 
     public async Task<ResourceDto> Handle(CreateResourceCommand request, CancellationToken cancellationToken)
     {
-        var tenantId = _tenantService.TenantId 
-            ?? throw new DomainException("Tenant context is required.");
+        var tenantId = _tenant.RequireTenantId();
+        var providerId = _actor.RequireRole(UserRole.Provider);
 
-        var provider = await _context.Users
-            .FirstOrDefaultAsync(u => u.Id == request.ProviderId && u.IsActive, cancellationToken)
-            ?? throw new NotFoundException(nameof(User), request.ProviderId);
+        var provider = await _context.Users.FirstAsync(u => u.Id == providerId, cancellationToken);
 
         var resource = new BookableResource
         {
             TenantId = tenantId,
             ProviderId = provider.Id,
             Title = request.Title,
-            Description = request.Description,
+            Description = request.Description ?? string.Empty,
             HourlyRate = request.HourlyRate,
-            Currency = request.Currency,
+            Currency = request.Currency.ToUpperInvariant(),
             TimeZone = request.TimeZone,
             IsActive = true
         };
@@ -63,16 +65,9 @@ public class CreateResourceCommandHandler : IRequestHandler<CreateResourceComman
         await _context.SaveChangesAsync(cancellationToken);
 
         return new ResourceDto(
-            resource.Id,
-            resource.TenantId,
-            resource.ProviderId,
-            provider.FullName,
-            resource.Title,
-            resource.Description,
-            resource.HourlyRate,
-            resource.Currency,
-            resource.TimeZone,
-            resource.IsActive);
+            resource.Id, resource.TenantId, resource.ProviderId, provider.FullName,
+            resource.Title, resource.Description, resource.HourlyRate,
+            resource.Currency, resource.TimeZone, resource.IsActive);
     }
 }
 
@@ -89,10 +84,7 @@ public class GetResourcesQueryHandler : IRequestHandler<GetResourcesQuery, IRead
 
     public async Task<IReadOnlyList<ResourceDto>> Handle(GetResourcesQuery request, CancellationToken cancellationToken)
     {
-        var query = _readContext.BookableResources
-            .AsNoTracking()
-            .Include(r => r.Provider)
-            .AsQueryable();
+        var query = _readContext.BookableResources.AsQueryable();
 
         if (request.OnlyActive)
         {
@@ -111,8 +103,7 @@ public class GetResourcesQueryHandler : IRequestHandler<GetResourcesQuery, IRead
                 r.HourlyRate,
                 r.Currency,
                 r.TimeZone,
-                r.IsActive
-            ))
+                r.IsActive))
             .ToListAsync(cancellationToken);
     }
 }

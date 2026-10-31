@@ -8,50 +8,47 @@ public class CreateBookingCommandValidatorTests
 {
     private readonly CreateBookingCommandValidator _validator = new();
 
-    [Fact]
-    public void Validate_ValidCommand_Passes()
-    {
-        var start = DateTimeOffset.UtcNow.AddDays(1);
-        var command = new CreateBookingCommand(
-            ResourceId: Guid.NewGuid(),
-            BuyerId: Guid.NewGuid(),
-            StartTime: start,
-            EndTime: start.AddHours(2));
+    private static CreateBookingCommand Command(DateTimeOffset start, TimeSpan duration) =>
+        new(ResourceId: Guid.NewGuid(), StartTime: start, EndTime: start + duration);
 
-        var result = _validator.Validate(command);
+    [Fact]
+    public void ValidCommand_Passes()
+    {
+        var result = _validator.Validate(Command(DateTimeOffset.UtcNow.AddDays(1), TimeSpan.FromHours(2)));
 
         result.IsValid.Should().BeTrue();
     }
 
     [Fact]
-    public void Validate_EndTimeBeforeStartTime_Fails()
+    public void EndBeforeStart_Fails()
     {
-        var start = DateTimeOffset.UtcNow.AddDays(1);
-        var command = new CreateBookingCommand(
-            ResourceId: Guid.NewGuid(),
-            BuyerId: Guid.NewGuid(),
-            StartTime: start,
-            EndTime: start.AddHours(-1));
-
-        var result = _validator.Validate(command);
+        var result = _validator.Validate(Command(DateTimeOffset.UtcNow.AddDays(1), TimeSpan.FromHours(-1)));
 
         result.IsValid.Should().BeFalse();
         result.Errors.Should().Contain(e => e.PropertyName == nameof(CreateBookingCommand.EndTime));
     }
 
     [Fact]
-    public void Validate_DurationLessThan15Minutes_Fails()
+    public void ShorterThan15Minutes_Fails()
     {
-        var start = DateTimeOffset.UtcNow.AddDays(1);
-        var command = new CreateBookingCommand(
-            ResourceId: Guid.NewGuid(),
-            BuyerId: Guid.NewGuid(),
-            StartTime: start,
-            EndTime: start.AddMinutes(10));
+        var result = _validator.Validate(Command(DateTimeOffset.UtcNow.AddDays(1), TimeSpan.FromMinutes(10)));
 
-        var result = _validator.Validate(command);
-
-        result.IsValid.Should().BeFalse();
         result.Errors.Should().Contain(e => e.ErrorMessage.Contains("at least 15 minutes"));
+    }
+
+    [Fact]
+    public void LongerThan24Hours_Fails()
+    {
+        var result = _validator.Validate(Command(DateTimeOffset.UtcNow.AddDays(1), TimeSpan.FromHours(25)));
+
+        result.Errors.Should().Contain(e => e.ErrorMessage.Contains("24 hours"));
+    }
+
+    [Fact]
+    public void StartInThePast_Fails()
+    {
+        var result = _validator.Validate(Command(DateTimeOffset.UtcNow.AddHours(-2), TimeSpan.FromHours(1)));
+
+        result.Errors.Should().Contain(e => e.PropertyName == nameof(CreateBookingCommand.StartTime));
     }
 }

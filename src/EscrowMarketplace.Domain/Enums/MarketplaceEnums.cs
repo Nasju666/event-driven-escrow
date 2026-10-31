@@ -1,16 +1,19 @@
 namespace EscrowMarketplace.Domain.Enums;
 
+// Numeric values are persisted. The GiST exclusion constraint frees a slot for
+// Cancelled (5), Expired (6) and Refunded (7), so keep those values stable.
 public enum BookingStatus
 {
-    PendingPayment = 0,
-    Held = 1,
-    Confirmed = 2,
-    InService = 3,
-    Completed = 4,
+    PendingPayment = 0,   // slot reserved, waiting for the buyer to pay
+    Held = 1,             // paid into escrow, waiting for the provider to accept
+    Confirmed = 2,        // provider accepted
+    InService = 3,        // session in progress (optional step)
+    Completed = 4,        // provider marked done, inspection window running
     Cancelled = 5,
-    Expired = 6,
+    Expired = 6,          // buyer never paid
     Refunded = 7,
-    Disputed = 8
+    Disputed = 8,
+    Settled = 9           // payout released to the provider
 }
 
 public enum EscrowStatus
@@ -20,7 +23,8 @@ public enum EscrowStatus
     Funded = 2,
     Settled = 3,
     Refunded = 4,
-    Disputed = 5
+    Disputed = 5,
+    Voided = 6            // booking ended before any money moved
 }
 
 public enum LedgerEntryType

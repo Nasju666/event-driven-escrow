@@ -2,6 +2,10 @@ using EscrowMarketplace.Domain.Enums;
 
 namespace EscrowMarketplace.Application.Common.Models;
 
+/// <summary>
+/// A booking together with the escrow summary the UI needs, so clients never have to
+/// hardcode fees or make a second call to know what happens next.
+/// </summary>
 public record BookingDto(
     Guid Id,
     Guid TenantId,
@@ -16,8 +20,17 @@ public record BookingDto(
     decimal TotalAmount,
     string Currency,
     BookingStatus Status,
-    uint RowVersion,
-    DateTimeOffset CreatedAt
+    DateTimeOffset PaymentDueUtc,
+    DateTimeOffset? ProviderResponseDueUtc,
+    string? CancellationReason,
+    DateTimeOffset CreatedAt,
+    Guid? EscrowId,
+    EscrowStatus? EscrowStatus,
+    decimal PlatformCommissionPercent,
+    decimal PlatformCommissionAmount,
+    decimal ProviderPayoutAmount,
+    DateTimeOffset? InspectionDeadlineUtc,
+    Guid? OpenDisputeId
 );
 
 public record EscrowDto(
@@ -38,7 +51,6 @@ public record EscrowDto(
     DateTimeOffset? SettledAt,
     DateTimeOffset? RefundedAt,
     DateTimeOffset? InspectionDeadlineUtc,
-    uint RowVersion,
     DateTimeOffset CreatedAt,
     IReadOnlyList<EscrowLedgerEntryDto> LedgerEntries
 );
@@ -83,4 +95,15 @@ public record DisputeDto(
     string? ResolutionNotes,
     DateTimeOffset? ResolvedAt,
     DateTimeOffset CreatedAt
+);
+
+public record CurrentUserDto(
+    Guid Id,
+    string FullName,
+    string Email,
+    UserRole Role,
+    Guid TenantId,
+    string TenantName,
+    decimal WalletBalance,
+    string Currency
 );

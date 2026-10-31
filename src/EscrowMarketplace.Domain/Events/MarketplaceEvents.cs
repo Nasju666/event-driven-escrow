@@ -1,9 +1,13 @@
 namespace EscrowMarketplace.Domain.Events;
 
+/// <summary>
+/// Marker for events raised by aggregates. Every event carries the BookingId so the escrow
+/// saga can correlate it, and the TenantId so consumers can restore tenant context.
+/// </summary>
 public interface IDomainEvent
 {
-    Guid EventId => Guid.NewGuid();
-    DateTimeOffset OccurredOn => DateTimeOffset.UtcNow;
+    Guid BookingId { get; }
+    Guid TenantId { get; }
 }
 
 public record BookingSlotReservedEvent(
@@ -15,23 +19,30 @@ public record BookingSlotReservedEvent(
     DateTimeOffset StartTime,
     DateTimeOffset EndTime,
     decimal TotalAmount,
-    string Currency
+    string Currency,
+    DateTimeOffset PaymentDueUtc
 ) : IDomainEvent;
 
 public record EscrowFundsAuthorizedEvent(
-    Guid EscrowAccountId,
     Guid BookingId,
     Guid TenantId,
+    Guid EscrowAccountId,
     decimal TotalAmount,
     string PaymentReference
 ) : IDomainEvent;
 
 public record EscrowFundsCapturedEvent(
-    Guid EscrowAccountId,
     Guid BookingId,
     Guid TenantId,
-    decimal TotalAmount,
-    DateTimeOffset InspectionDeadline
+    Guid EscrowAccountId,
+    decimal TotalAmount
+) : IDomainEvent;
+
+/// <summary>Buyer paid. The provider has until ProviderResponseDueUtc to accept.</summary>
+public record BookingPaidEvent(
+    Guid BookingId,
+    Guid TenantId,
+    DateTimeOffset ProviderResponseDueUtc
 ) : IDomainEvent;
 
 public record ProviderConfirmedBookingEvent(
@@ -40,18 +51,29 @@ public record ProviderConfirmedBookingEvent(
     Guid ProviderId
 ) : IDomainEvent;
 
+/// <summary>Provider marked the session done. The buyer can dispute until InspectionDeadlineUtc.</summary>
 public record ServiceCompletedEvent(
     Guid BookingId,
-    Guid TenantId
+    Guid TenantId,
+    DateTimeOffset InspectionDeadlineUtc
 ) : IDomainEvent;
 
 public record EscrowPayoutReleasedEvent(
-    Guid EscrowAccountId,
     Guid BookingId,
     Guid TenantId,
+    Guid EscrowAccountId,
     Guid ProviderId,
     decimal ProviderPayoutAmount,
     decimal PlatformCommissionAmount
+) : IDomainEvent;
+
+public record EscrowRefundedEvent(
+    Guid BookingId,
+    Guid TenantId,
+    Guid EscrowAccountId,
+    Guid BuyerId,
+    decimal Amount,
+    string Reason
 ) : IDomainEvent;
 
 public record BookingCancelledEvent(
@@ -61,31 +83,25 @@ public record BookingCancelledEvent(
     string Reason
 ) : IDomainEvent;
 
-public record EscrowDisputeRaisedEvent(
-    Guid DisputeId,
-    Guid EscrowAccountId,
+public record BookingExpiredEvent(
     Guid BookingId,
     Guid TenantId,
+    Guid ResourceId
+) : IDomainEvent;
+
+public record EscrowDisputeRaisedEvent(
+    Guid BookingId,
+    Guid TenantId,
+    Guid DisputeId,
+    Guid EscrowAccountId,
     Guid RaisedByUserId,
     string Reason
 ) : IDomainEvent;
 
 public record EscrowDisputeResolvedEvent(
+    Guid BookingId,
+    Guid TenantId,
     Guid DisputeId,
     Guid EscrowAccountId,
-    Guid BookingId,
-    Guid TenantId,
     string Resolution
 ) : IDomainEvent;
-
-public record EscrowStatusChangedIntegrationEvent(
-    Guid BookingId,
-    Guid EscrowAccountId,
-    Guid TenantId,
-    Guid BuyerId,
-    Guid ProviderId,
-    string PreviousStatus,
-    string NewStatus,
-    string Message,
-    DateTimeOffset Timestamp
-);

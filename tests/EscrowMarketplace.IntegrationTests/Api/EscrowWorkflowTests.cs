@@ -1,106 +1,204 @@
-using System.Net;
-using System.Net.Http.Json;
+using EscrowMarketplace.Application.Common.Interfaces;
 using EscrowMarketplace.Application.Common.Models;
-using EscrowMarketplace.Application.Features.Bookings.Commands;
 using EscrowMarketplace.Domain.Enums;
 using FluentAssertions;
-using Xunit;
 
 namespace EscrowMarketplace.IntegrationTests.Api;
 
-public class EscrowWorkflowTests : IClassFixture<CustomWebApplicationFactory>
+/// <summary>
+/// End-to-end escrow lifecycle through the HTTP API: wallet movements, the ledger, disputes,
+/// and the saga's inspection-window timeout (3 seconds in appsettings.Testing.json), running on
+/// PostgreSQL + EF outbox + saga + delayed scheduler.
+/// </summary>
+[Collection(ApiCollection.Name)]
+public class EscrowWorkflowTests
 {
-    private readonly HttpClient _client;
-    private readonly Guid _tenantId = Guid.Parse("11111111-1111-1111-1111-111111111111");
-    private readonly Guid _resourceId = Guid.Parse("66666666-6666-6666-6666-666666666666"); // $120/hr
-    private readonly Guid _providerId = Guid.Parse("33333333-3333-3333-3333-333333333333");
-    private readonly Guid _buyerId = Guid.Parse("44444444-4444-4444-4444-444444444444");
+    private static readonly TimeSpan SagaTimeout = TimeSpan.FromSeconds(30);
+    private readonly CustomWebApplicationFactory _factory;
 
     public EscrowWorkflowTests(CustomWebApplicationFactory factory)
     {
-        _client = factory.CreateClient();
-        _client.DefaultRequestHeaders.Add("X-Tenant-Id", _tenantId.ToString());
+        _factory = factory;
     }
 
     [Fact]
-    public async Task CompleteEscrowLifecycle_Authorize_Fund_Release_RecordsLedgerEntries()
+    public async Task BuyerApprovesEarly_PayoutReleased_AndMoneyBalances()
     {
-        // 1. Create Booking (2 hours = $240, 10% commission = $24 platform fee, $216 provider payout)
-        var start = DateTimeOffset.UtcNow.AddDays(15).Date.AddHours(14);
-        var createCmd = new CreateBookingCommand(_resourceId, _buyerId, start, start.AddHours(2));
-        var bookingResp = await _client.PostAsJsonAsync("/api/bookings", createCmd);
-        var booking = await bookingResp.Content.ReadFromJsonAsync<BookingDto>();
+        var buyer = await _factory.ClientForAsync(Users.Buyer);
+        var provider = await _factory.ClientForAsync(Users.Provider);
+        var buyerBefore = await buyer.WalletAsync();
+        var providerBefore = await provider.WalletAsync();
 
-        // 2. Fetch Escrow
-        var escrowResp = await _client.GetAsync($"/api/escrows/booking/{booking!.Id}");
-        escrowResp.StatusCode.Should().Be(HttpStatusCode.OK);
-        var escrow = await escrowResp.Content.ReadFromJsonAsync<EscrowDto>();
-        escrow!.Status.Should().Be(EscrowStatus.PendingAuthorization);
-        escrow.TotalAmount.Should().Be(240.00m);
-        escrow.PlatformCommissionAmount.Should().Be(24.00m);
-        escrow.ProviderPayoutAmount.Should().Be(216.00m);
+        var booking = await buyer.CreateBookingAsync(Resources.VocalBooth);   // $45
+        (await buyer.ActAsync(booking.Id, "pay")).Status.Should().Be(BookingStatus.Held);
+        (await buyer.WalletAsync()).Should().Be(buyerBefore - 45m);
 
-        // 3. Authorize Escrow
-        var authResp = await _client.PostAsJsonAsync($"/api/escrows/{escrow.Id}/authorize", new { PaymentReference = "mock_stripe_ch_998877" });
-        authResp.StatusCode.Should().Be(HttpStatusCode.OK);
-        var authorized = await authResp.Content.ReadFromJsonAsync<EscrowDto>();
-        authorized!.Status.Should().Be(EscrowStatus.Authorized);
+        (await provider.ActAsync(booking.Id, "confirm")).Status.Should().Be(BookingStatus.Confirmed);
+        var completed = await provider.ActAsync(booking.Id, "complete");
+        completed.Status.Should().Be(BookingStatus.Completed);
+        completed.InspectionDeadlineUtc.Should().NotBeNull();
 
-        // 4. Fund Escrow (Capture funds into segregated hold ledger)
-        var fundResp = await _client.PostAsync($"/api/escrows/{escrow.Id}/fund?inspectionDays=2", null);
-        fundResp.StatusCode.Should().Be(HttpStatusCode.OK);
-        var funded = await fundResp.Content.ReadFromJsonAsync<EscrowDto>();
-        funded!.Status.Should().Be(EscrowStatus.Funded);
-        funded.LedgerEntries.Should().Contain(l => l.EntryType == LedgerEntryType.HoldDeposit && l.Amount == 240.00m);
+        var settled = await buyer.ActAsync(booking.Id, "approve");
 
-        // 5. Release Escrow Payout (Service verified -> credit provider $216, capture platform fee $24)
-        var releaseResp = await _client.PostAsync($"/api/escrows/{escrow.Id}/release", null);
-        releaseResp.StatusCode.Should().Be(HttpStatusCode.OK);
-        var settled = await releaseResp.Content.ReadFromJsonAsync<EscrowDto>();
-        settled!.Status.Should().Be(EscrowStatus.Settled);
-        settled.LedgerEntries.Should().HaveCount(3);
-        settled.LedgerEntries.Should().Contain(l => l.EntryType == LedgerEntryType.ProviderPayout && l.Amount == 216.00m);
-        settled.LedgerEntries.Should().Contain(l => l.EntryType == LedgerEntryType.PlatformFee && l.Amount == 24.00m);
+        settled.Status.Should().Be(BookingStatus.Settled);
+        settled.EscrowStatus.Should().Be(EscrowStatus.Settled);
+        (await provider.WalletAsync()).Should().Be(providerBefore + 40.50m);  // 45 - 10% fee
+
+        var escrow = await (await buyer.GetAsync($"/api/escrows/booking/{booking.Id}")).ReadAsync<EscrowDto>();
+        escrow.LedgerEntries.Select(l => l.EntryType).Should().BeEquivalentTo(new[]
+        {
+            LedgerEntryType.HoldDeposit, LedgerEntryType.ProviderPayout, LedgerEntryType.PlatformFee
+        });
     }
 
     [Fact]
-    public async Task DisputeWorkflow_CanRaiseAndResolveDispute()
+    public async Task InspectionWindowElapses_SagaReleasesPayoutAutomatically()
     {
-        var start = DateTimeOffset.UtcNow.AddDays(20).Date.AddHours(10);
-        var createCmd = new CreateBookingCommand(_resourceId, _buyerId, start, start.AddHours(1));
-        var bookingResp = await _client.PostAsJsonAsync("/api/bookings", createCmd);
-        var booking = await bookingResp.Content.ReadFromJsonAsync<BookingDto>();
+        var buyer = await _factory.ClientForAsync(Users.Buyer);
+        var provider = await _factory.ClientForAsync(Users.Provider);
+        var providerBefore = await provider.WalletAsync();
 
-        var escrowResp = await _client.GetAsync($"/api/escrows/booking/{booking!.Id}");
-        var escrow = await escrowResp.Content.ReadFromJsonAsync<EscrowDto>();
+        var booking = await buyer.CreateBookingAsync(Resources.VocalBooth);
+        await buyer.ActAsync(booking.Id, "pay");
+        await provider.ActAsync(booking.Id, "confirm");
+        await provider.ActAsync(booking.Id, "complete");
 
-        // Fund escrow
-        await _client.PostAsJsonAsync($"/api/escrows/{escrow!.Id}/authorize", new { PaymentReference = "ch_dispute_123" });
-        await _client.PostAsync($"/api/escrows/{escrow.Id}/fund", null);
+        // Nobody calls approve. The ServiceCompletedEvent goes through the outbox to the saga,
+        // which schedules InspectionWindowElapsed. When it fires, the saga issues
+        // ReleaseEscrowAfterInspection and the consumer settles the booking as the system actor.
+        var settled = await buyer.WaitForStatusAsync(booking.Id, BookingStatus.Settled, SagaTimeout);
 
-        // Raise Dispute
-        var disputeReq = new
+        settled.EscrowStatus.Should().Be(EscrowStatus.Settled);
+        (await provider.WalletAsync()).Should().Be(providerBefore + 40.50m);
+
+        var workflow = await WaitForWorkflowStateAsync(buyer, booking.Id, "Settled");
+        workflow.NextDeadlineUtc.Should().BeNull();
+    }
+
+    [Fact]
+    public async Task Dispute_FreezesFunds_AndBlocksAutoRelease()
+    {
+        var buyer = await _factory.ClientForAsync(Users.Buyer);
+        var provider = await _factory.ClientForAsync(Users.Provider);
+
+        var booking = await buyer.CreateBookingAsync(Resources.VocalBooth);
+        await buyer.ActAsync(booking.Id, "pay");
+        await provider.ActAsync(booking.Id, "confirm");
+        await provider.ActAsync(booking.Id, "complete");
+        (await buyer.PostJsonAsync($"/api/bookings/{booking.Id}/dispute",
+            new { reason = "Booth mic was broken", evidenceSummary = "Recording attached" })).EnsureSuccessStatusCode();
+
+        // Well past the 3s inspection window: the scheduled timeout must not release anything.
+        await Task.Delay(TimeSpan.FromSeconds(6));
+
+        var current = await buyer.GetBookingAsync(booking.Id);
+        current.Status.Should().Be(BookingStatus.Disputed);
+        current.EscrowStatus.Should().Be(EscrowStatus.Disputed);
+        current.OpenDisputeId.Should().NotBeNull();
+    }
+
+    [Fact]
+    public async Task DisputeResolvedForProvider_ReleasesPayout()
+    {
+        // Regression test: this path used to always throw (ReleasePayout required Funded).
+        var buyer = await _factory.ClientForAsync(Users.Buyer);
+        var provider = await _factory.ClientForAsync(Users.Provider);
+        var admin = await _factory.ClientForAsync(Users.Admin);
+        var providerBefore = await provider.WalletAsync();
+
+        var disputeId = await CreateDisputedBookingAsync(buyer, provider);
+
+        var resolved = await (await admin.PostJsonAsync($"/api/escrows/disputes/{disputeId}/resolve", new
         {
-            RaisedByUserId = _buyerId,
-            Reason = "Equipment in studio was malfunctioning during booked session",
-            EvidenceSummary = "Mixing console power failure audio drop logs attached"
-        };
+            resolution = DisputeStatus.ResolvedInFavorOfProvider,
+            resolutionNotes = "Session logs show the booth was working."
+        })).ReadAsync<DisputeDto>();
 
-        var disputeResp = await _client.PostAsJsonAsync($"/api/escrows/{escrow.Id}/dispute", disputeReq);
-        disputeResp.StatusCode.Should().Be(HttpStatusCode.OK);
-        var dispute = await disputeResp.Content.ReadFromJsonAsync<DisputeDto>();
-        dispute!.Status.Should().Be(DisputeStatus.PendingReview);
+        resolved.Status.Should().Be(DisputeStatus.ResolvedInFavorOfProvider);
+        (await buyer.GetBookingAsync(resolved.BookingId)).Status.Should().Be(BookingStatus.Settled);
+        (await provider.WalletAsync()).Should().Be(providerBefore + 40.50m);
+    }
 
-        // Resolve in favor of Buyer (Refund)
-        var resolveReq = new
+    [Fact]
+    public async Task DisputeResolvedForBuyer_RefundsInFull()
+    {
+        var buyer = await _factory.ClientForAsync(Users.Buyer);
+        var provider = await _factory.ClientForAsync(Users.Provider);
+        var admin = await _factory.ClientForAsync(Users.Admin);
+        var buyerBefore = await buyer.WalletAsync();
+
+        var disputeId = await CreateDisputedBookingAsync(buyer, provider);
+
+        var resolved = await (await admin.PostJsonAsync($"/api/escrows/disputes/{disputeId}/resolve", new
         {
-            Resolution = DisputeStatus.ResolvedInFavorOfBuyer,
-            ResolutionNotes = "Verified equipment malfunction with provider host. Full buyer refund issued."
-        };
+            resolution = DisputeStatus.ResolvedInFavorOfBuyer,
+            resolutionNotes = "Provider confirmed the mic failed."
+        })).ReadAsync<DisputeDto>();
 
-        var resolveResp = await _client.PostAsJsonAsync($"/api/escrows/disputes/{dispute.Id}/resolve", resolveReq);
-        resolveResp.StatusCode.Should().Be(HttpStatusCode.OK);
-        var resolved = await resolveResp.Content.ReadFromJsonAsync<DisputeDto>();
-        resolved!.Status.Should().Be(DisputeStatus.ResolvedInFavorOfBuyer);
+        var booking = await buyer.GetBookingAsync(resolved.BookingId);
+        booking.Status.Should().Be(BookingStatus.Refunded);
+        booking.EscrowStatus.Should().Be(EscrowStatus.Refunded);
+        (await buyer.WalletAsync()).Should().Be(buyerBefore);   // paid 45, got 45 back
+    }
+
+    [Fact]
+    public async Task ProviderCancelsAfterPayment_BuyerRefundedInFull()
+    {
+        var buyer = await _factory.ClientForAsync(Users.Buyer);
+        var provider = await _factory.ClientForAsync(Users.Provider);
+        var buyerBefore = await buyer.WalletAsync();
+
+        var booking = await buyer.CreateBookingAsync(Resources.VocalBooth);
+        await buyer.ActAsync(booking.Id, "pay");
+
+        var cancelled = await provider.ActAsync(booking.Id, "cancel", new { reason = "Studio flooded" });
+
+        cancelled.Status.Should().Be(BookingStatus.Refunded);
+        cancelled.EscrowStatus.Should().Be(EscrowStatus.Refunded);
+        (await buyer.WalletAsync()).Should().Be(buyerBefore);
+    }
+
+    [Fact]
+    public async Task CancelBeforePayment_VoidsEscrow_NoMoneyMoves()
+    {
+        var buyer = await _factory.ClientForAsync(Users.Buyer);
+        var buyerBefore = await buyer.WalletAsync();
+
+        var booking = await buyer.CreateBookingAsync(Resources.VocalBooth);
+        var cancelled = await buyer.ActAsync(booking.Id, "cancel", new { reason = "Booked by mistake" });
+
+        cancelled.Status.Should().Be(BookingStatus.Cancelled);
+        cancelled.EscrowStatus.Should().Be(EscrowStatus.Voided);
+        (await buyer.WalletAsync()).Should().Be(buyerBefore);
+    }
+
+    private static async Task<Guid> CreateDisputedBookingAsync(HttpClient buyer, HttpClient provider)
+    {
+        var booking = await buyer.CreateBookingAsync(Resources.VocalBooth);
+        await buyer.ActAsync(booking.Id, "pay");
+        await provider.ActAsync(booking.Id, "confirm");
+
+        // Dispute before completion, so the 3s inspection timeout plays no part in this test.
+        var dispute = await (await buyer.PostJsonAsync($"/api/bookings/{booking.Id}/dispute",
+            new { reason = "Studio double-booked on arrival", evidenceSummary = "Photos" })).ReadAsync<DisputeDto>();
+        return dispute.Id;
+    }
+
+    private static async Task<WorkflowStateDto> WaitForWorkflowStateAsync(HttpClient client, Guid bookingId, string state)
+    {
+        var deadline = DateTime.UtcNow + SagaTimeout;
+        WorkflowStateDto? last = null;
+        while (DateTime.UtcNow < deadline)
+        {
+            var response = await client.GetAsync($"/api/bookings/{bookingId}/workflow");
+            if (response.IsSuccessStatusCode)
+            {
+                last = await response.ReadAsync<WorkflowStateDto>();
+                if (last.State == state) return last;
+            }
+            await Task.Delay(250);
+        }
+
+        throw new TimeoutException($"Workflow for {bookingId} is '{last?.State ?? "missing"}', expected '{state}'.");
     }
 }

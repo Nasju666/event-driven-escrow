@@ -1,12 +1,16 @@
+using EscrowMarketplace.Api.Authentication;
 using EscrowMarketplace.Application.Common.Models;
 using EscrowMarketplace.Application.Features.Resources.Commands;
 using MediatR;
+using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.RateLimiting;
 
 namespace EscrowMarketplace.Api.Controllers;
 
 [ApiController]
-[Route("api/[controller]")]
+[Route("api/resources")]
+[EnableRateLimiting(RateLimitPolicies.PerUser)]
 public class ResourcesController : ControllerBase
 {
     private readonly ISender _sender;
@@ -17,23 +21,15 @@ public class ResourcesController : ControllerBase
     }
 
     [HttpGet]
-    [ProducesResponseType(typeof(IReadOnlyList<ResourceDto>), StatusCodes.Status200OK)]
-    public async Task<ActionResult<IReadOnlyList<ResourceDto>>> GetResources(
-        [FromQuery] bool onlyActive = true,
-        CancellationToken cancellationToken = default)
-    {
-        var result = await _sender.Send(new GetResourcesQuery(onlyActive), cancellationToken);
-        return Ok(result);
-    }
+    public async Task<ActionResult<IReadOnlyList<ResourceDto>>> List([FromQuery] bool onlyActive = true, CancellationToken ct = default)
+        => Ok(await _sender.Send(new GetResourcesQuery(onlyActive), ct));
 
     [HttpPost]
+    [Authorize(Policy = Policies.Provider)]
     [ProducesResponseType(typeof(ResourceDto), StatusCodes.Status201Created)]
-    [ProducesResponseType(typeof(ProblemDetails), StatusCodes.Status400BadRequest)]
-    public async Task<ActionResult<ResourceDto>> CreateResource(
-        [FromBody] CreateResourceCommand command,
-        CancellationToken cancellationToken)
+    public async Task<ActionResult<ResourceDto>> Create([FromBody] CreateResourceCommand command, CancellationToken ct)
     {
-        var result = await _sender.Send(command, cancellationToken);
-        return CreatedAtAction(nameof(GetResources), new { id = result.Id }, result);
+        var result = await _sender.Send(command, ct);
+        return Created($"/api/resources/{result.Id}", result);
     }
 }

@@ -1,4 +1,5 @@
 using EscrowMarketplace.Domain.Entities;
+using EscrowMarketplace.Domain.Enums;
 using Microsoft.EntityFrameworkCore;
 
 namespace EscrowMarketplace.Application.Common.Interfaces;
@@ -27,6 +28,10 @@ public interface IReadDbContext
     IQueryable<Dispute> Disputes { get; }
 }
 
+/// <summary>
+/// The tenant for the current request or message. Set from the JWT "tenant_id" claim for HTTP
+/// requests and from the message for background consumers. Never from client-supplied headers.
+/// </summary>
 public interface ICurrentTenantService
 {
     Guid? TenantId { get; }
@@ -34,39 +39,32 @@ public interface ICurrentTenantService
     void SetTenant(Guid tenantId, string identifier);
 }
 
-public interface ICacheService
+/// <summary>
+/// Who is performing the current operation: an authenticated user (from the JWT) or the
+/// system itself (saga timeouts). Handlers use this for authorization, never request bodies.
+/// </summary>
+public interface ICurrentActor
 {
-    Task<T?> GetAsync<T>(string key, CancellationToken cancellationToken = default);
-    Task SetAsync<T>(string key, T value, TimeSpan? expiration = null, CancellationToken cancellationToken = default);
-    Task RemoveAsync(string key, CancellationToken cancellationToken = default);
+    Guid? UserId { get; }
+    UserRole? Role { get; }
+    bool IsSystem { get; }
+    void SetUser(Guid userId, UserRole role);
+    void SetSystem();
 }
 
-public interface IEscrowPaymentGateway
+/// <summary>Reads the escrow saga's persisted state for a booking (null when not available).</summary>
+public interface IEscrowWorkflowReader
 {
-    Task<(bool Success, string TransactionId, string? ErrorMessage)> AuthorizePaymentAsync(
-        Guid buyerId, decimal amount, string currency, CancellationToken cancellationToken = default);
-
-    Task<(bool Success, string? ErrorMessage)> CapturePaymentAsync(
-        string transactionId, decimal amount, CancellationToken cancellationToken = default);
-
-    Task<(bool Success, string? ErrorMessage)> RefundPaymentAsync(
-        string transactionId, decimal amount, string reason, CancellationToken cancellationToken = default);
+    Task<WorkflowStateDto?> GetAsync(Guid bookingId, CancellationToken cancellationToken = default);
 }
 
-public interface IBookingClient
-{
-    Task BookingCreated(object bookingDto);
-    Task BookingStatusChanged(string bookingId, string status, string message);
-    Task EscrowStatusChanged(string escrowId, string status, decimal amount);
-    Task AvailabilityChanged(string resourceId, DateTimeOffset start, DateTimeOffset end);
-}
-
-public interface IBookingNotifier
-{
-    Task NotifyBookingCreatedAsync(Guid tenantId, Guid bookingId, object payload, CancellationToken cancellationToken = default);
-    Task NotifyStatusChangedAsync(Guid tenantId, Guid bookingId, string status, string message, CancellationToken cancellationToken = default);
-    Task NotifyEscrowTransitionAsync(Guid tenantId, Guid escrowId, string status, decimal amount, CancellationToken cancellationToken = default);
-}
+public record WorkflowStateDto(
+    Guid BookingId,
+    string State,
+    DateTimeOffset CreatedAt,
+    DateTimeOffset? UpdatedAt,
+    DateTimeOffset? NextDeadlineUtc,
+    string? NextDeadlineKind);
 
 public interface IAnalyticsRepository
 {

@@ -1,9 +1,9 @@
-using System.Text.Json;
 using EscrowMarketplace.Application.Common.Interfaces;
+using EscrowMarketplace.Domain.Enums;
 using EscrowMarketplace.Infrastructure.Hubs;
+using EscrowMarketplace.Infrastructure.Persistence;
 using Microsoft.AspNetCore.SignalR;
-using Microsoft.Extensions.Caching.Distributed;
-using Microsoft.Extensions.Logging;
+using Microsoft.EntityFrameworkCore;
 
 namespace EscrowMarketplace.Infrastructure.Services;
 
@@ -19,128 +19,101 @@ public class CurrentTenantService : ICurrentTenantService
     }
 }
 
-public class RedisCacheService : ICacheService
+public class CurrentActor : ICurrentActor
 {
-    private readonly IDistributedCache _cache;
-    private readonly ILogger<RedisCacheService> _logger;
+    public Guid? UserId { get; private set; }
+    public UserRole? Role { get; private set; }
+    public bool IsSystem { get; private set; }
 
-    public RedisCacheService(IDistributedCache cache, ILogger<RedisCacheService> logger)
+    public void SetUser(Guid userId, UserRole role)
     {
-        _cache = cache;
-        _logger = logger;
+        UserId = userId;
+        Role = role;
+        IsSystem = false;
     }
 
-    public async Task<T?> GetAsync<T>(string key, CancellationToken cancellationToken = default)
+    public void SetSystem()
     {
-        try
-        {
-            var data = await _cache.GetStringAsync(key, cancellationToken);
-            if (string.IsNullOrEmpty(data)) return default;
-            return JsonSerializer.Deserialize<T>(data);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogWarning(ex, "Failed to retrieve cache key {Key}", key);
-            return default;
-        }
-    }
-
-    public async Task SetAsync<T>(string key, T value, TimeSpan? expiration = null, CancellationToken cancellationToken = default)
-    {
-        try
-        {
-            var options = new DistributedCacheEntryOptions
-            {
-                AbsoluteExpirationRelativeToNow = expiration ?? TimeSpan.FromMinutes(10)
-            };
-            var json = JsonSerializer.Serialize(value);
-            await _cache.SetStringAsync(key, json, options, cancellationToken);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogWarning(ex, "Failed to set cache key {Key}", key);
-        }
-    }
-
-    public async Task RemoveAsync(string key, CancellationToken cancellationToken = default)
-    {
-        try
-        {
-            await _cache.RemoveAsync(key, cancellationToken);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogWarning(ex, "Failed to remove cache key {Key}", key);
-        }
+        UserId = null;
+        Role = null;
+        IsSystem = true;
     }
 }
 
-public class MockEscrowPaymentGateway : IEscrowPaymentGateway
+/// <summary>Message pushed to browsers. Kind is "event" (domain event) or "workflow" (saga transition).</summary>
+public record BookingUpdateMessage(
+    string BookingId,
+    string Kind,
+    string Name,
+    string Message,
+    DateTimeOffset? NextDeadlineUtc,
+    DateTimeOffset At);
+
+public interface IBookingClient
 {
-    private readonly ILogger<MockEscrowPaymentGateway> _logger;
+    Task BookingUpdated(BookingUpdateMessage update);
+}
 
-    public MockEscrowPaymentGateway(ILogger<MockEscrowPaymentGateway> logger)
-    {
-        _logger = logger;
-    }
+public interface IBookingNotifier
+{
+    Task BookingUpdatedAsync(Guid tenantId, Guid bookingId, Guid buyerId, Guid providerId,
+        string eventType, string message, CancellationToken cancellationToken = default);
 
-    public Task<(bool Success, string TransactionId, string? ErrorMessage)> AuthorizePaymentAsync(
-        Guid buyerId, decimal amount, string currency, CancellationToken cancellationToken = default)
-    {
-        var authRef = $"auth_{Guid.NewGuid():N}_{DateTimeOffset.UtcNow.ToUnixTimeSeconds()}";
-        _logger.LogInformation("Mock Payment Gateway authorized {Amount} {Currency} for Buyer {BuyerId}. Ref: {AuthRef}",
-            amount, currency, buyerId, authRef);
-
-        return Task.FromResult((true, authRef, (string?)null));
-    }
-
-    public Task<(bool Success, string? ErrorMessage)> CapturePaymentAsync(
-        string transactionId, decimal amount, CancellationToken cancellationToken = default)
-    {
-        _logger.LogInformation("Mock Payment Gateway captured {Amount} on Ref: {TransactionId}", amount, transactionId);
-        return Task.FromResult((true, (string?)null));
-    }
-
-    public Task<(bool Success, string? ErrorMessage)> RefundPaymentAsync(
-        string transactionId, decimal amount, string reason, CancellationToken cancellationToken = default)
-    {
-        _logger.LogInformation("Mock Payment Gateway refunded {Amount} on Ref: {TransactionId}. Reason: {Reason}",
-            amount, transactionId, reason);
-        return Task.FromResult((true, (string?)null));
-    }
+    Task WorkflowTransitionedAsync(Guid tenantId, Guid bookingId, Guid buyerId, Guid providerId,
+        string state, string detail, DateTimeOffset? nextDeadlineUtc, CancellationToken cancellationToken = default);
 }
 
 public class BookingNotifier : IBookingNotifier
 {
     private readonly IHubContext<MarketplaceBookingHub, IBookingClient> _hubContext;
-    private readonly ILogger<BookingNotifier> _logger;
 
-    public BookingNotifier(
-        IHubContext<MarketplaceBookingHub, IBookingClient> hubContext,
-        ILogger<BookingNotifier> logger)
+    public BookingNotifier(IHubContext<MarketplaceBookingHub, IBookingClient> hubContext)
     {
         _hubContext = hubContext;
-        _logger = logger;
     }
 
-    public async Task NotifyBookingCreatedAsync(Guid tenantId, Guid bookingId, object payload, CancellationToken cancellationToken = default)
+    public Task BookingUpdatedAsync(Guid tenantId, Guid bookingId, Guid buyerId, Guid providerId,
+        string eventType, string message, CancellationToken cancellationToken = default)
     {
-        var group = $"tenant:{tenantId}";
-        _logger.LogInformation("SignalR Broadcasting BookingCreated to {Group}", group);
-        await _hubContext.Clients.Group(group).BookingCreated(payload);
+        var update = new BookingUpdateMessage(bookingId.ToString(), "event", eventType, message, null, DateTimeOffset.UtcNow);
+        return _hubContext.Clients.Groups(Audience(tenantId, buyerId, providerId)).BookingUpdated(update);
     }
 
-    public async Task NotifyStatusChangedAsync(Guid tenantId, Guid bookingId, string status, string message, CancellationToken cancellationToken = default)
+    public Task WorkflowTransitionedAsync(Guid tenantId, Guid bookingId, Guid buyerId, Guid providerId,
+        string state, string detail, DateTimeOffset? nextDeadlineUtc, CancellationToken cancellationToken = default)
     {
-        var group = $"tenant:{tenantId}";
-        _logger.LogInformation("SignalR Broadcasting BookingStatusChanged ({Status}) to {Group}", status, group);
-        await _hubContext.Clients.Group(group).BookingStatusChanged(bookingId.ToString(), status, message);
+        var update = new BookingUpdateMessage(bookingId.ToString(), "workflow", state, detail, nextDeadlineUtc, DateTimeOffset.UtcNow);
+        return _hubContext.Clients.Groups(Audience(tenantId, buyerId, providerId)).BookingUpdated(update);
     }
 
-    public async Task NotifyEscrowTransitionAsync(Guid tenantId, Guid escrowId, string status, decimal amount, CancellationToken cancellationToken = default)
+    private static IReadOnlyList<string> Audience(Guid tenantId, Guid buyerId, Guid providerId) => new[]
     {
-        var group = $"tenant:{tenantId}";
-        _logger.LogInformation("SignalR Broadcasting EscrowStatusChanged ({Status}) to {Group}", status, group);
-        await _hubContext.Clients.Group(group).EscrowStatusChanged(escrowId.ToString(), status, amount);
+        HubGroups.User(buyerId),
+        HubGroups.User(providerId),
+        HubGroups.TenantAdmins(tenantId)
+    };
+}
+
+public class EscrowWorkflowReader : IEscrowWorkflowReader
+{
+    private readonly MarketplaceDbContext _context;
+
+    public EscrowWorkflowReader(MarketplaceDbContext context)
+    {
+        _context = context;
+    }
+
+    public async Task<WorkflowStateDto?> GetAsync(Guid bookingId, CancellationToken cancellationToken = default)
+    {
+        // In in-memory demo mode the saga uses MassTransit's in-memory repository, not this table.
+        if (!_context.Database.IsRelational())
+            return null;
+
+        return await _context.EscrowWorkflows
+            .AsNoTracking()
+            .Where(s => s.CorrelationId == bookingId)
+            .Select(s => new WorkflowStateDto(
+                s.CorrelationId, s.CurrentState, s.CreatedAt, s.UpdatedAt, s.NextDeadlineUtc, s.NextDeadlineKind))
+            .FirstOrDefaultAsync(cancellationToken);
     }
 }

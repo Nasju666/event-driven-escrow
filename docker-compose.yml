@@ -1,8 +1,10 @@
+name: studio-escrow
+
 services:
   postgres:
     image: postgres:16-alpine
     container_name: escrow-postgres
-    restart: always
+    restart: unless-stopped
     environment:
       POSTGRES_DB: EscrowMarketplaceDb
       POSTGRES_USER: postgres
@@ -17,24 +19,25 @@ services:
       timeout: 5s
       retries: 5
 
+  # SignalR backplane, only needed if you run more than one API instance.
   redis:
     image: redis:7-alpine
     container_name: escrow-redis
-    restart: always
+    restart: unless-stopped
     ports:
       - "6379:6379"
-    volumes:
-      - redisdata:/data
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
       timeout: 5s
       retries: 5
 
+  # Custom image: adds the delayed-message-exchange plugin the saga's timeouts depend on.
   rabbitmq:
-    image: rabbitmq:3.13-management-alpine
+    build:
+      context: ./infra/rabbitmq
     container_name: escrow-rabbitmq
-    restart: always
+    restart: unless-stopped
     ports:
       - "5672:5672"
       - "15672:15672"
@@ -58,12 +61,14 @@ services:
     environment:
       ASPNETCORE_ENVIRONMENT: Production
       ConnectionStrings__DefaultConnection: "Host=postgres;Port=5432;Database=EscrowMarketplaceDb;Username=postgres;Password=postgrespassword"
-      ConnectionStrings__Redis: "redis:6379"
       RabbitMQ__Host: "rabbitmq"
       RabbitMQ__Username: "guest"
       RabbitMQ__Password: "guest"
       SignalR__Redis: "redis:6379"
-      UseInMemoryDatabase: "false"
+      # Short windows so the whole escrow flow (including auto-release) can be demoed in minutes.
+      EscrowWorkflow__PaymentWindow: "00:05:00"
+      EscrowWorkflow__ProviderResponseWindow: "00:10:00"
+      EscrowWorkflow__InspectionWindow: "00:02:00"
     depends_on:
       postgres:
         condition: service_healthy
@@ -74,4 +79,3 @@ services:
 
 volumes:
   pgdata:
-  redisdata:

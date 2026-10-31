@@ -12,11 +12,6 @@ public class InvalidStateTransitionException : DomainException
         : base($"Invalid state transition for {entity} from '{fromState}' to '{toState}'.") { }
 }
 
-public class ConcurrencyConflictException : DomainException
-{
-    public ConcurrencyConflictException(string message) : base(message) { }
-}
-
 public class DoubleBookingExclusionException : DomainException
 {
     public DoubleBookingExclusionException(string message) : base(message) { }
@@ -26,4 +21,16 @@ public class NotFoundException : DomainException
 {
     public NotFoundException(string entity, object key)
         : base($"Entity '{entity}' with key '{key}' was not found.") { }
+}
+
+/// <summary>The caller is authenticated but may not perform this action. Mapped to HTTP 403.</summary>
+public class ForbiddenAccessException : DomainException
+{
+    public ForbiddenAccessException(string message) : base(message) { }
+}
+
+public class InsufficientFundsException : DomainException
+{
+    public InsufficientFundsException(decimal available, decimal required)
+        : base($"Insufficient wallet balance: {available:0.00} available, {required:0.00} required.") { }
 }

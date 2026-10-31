@@ -1,3 +1,4 @@
+using System.Security.Claims;
 using System.Text;
 using System.Threading.RateLimiting;
 using EscrowMarketplace.Api.Authentication;
@@ -9,7 +10,7 @@ using EscrowMarketplace.Infrastructure.Jobs;
 using EscrowMarketplace.Infrastructure.Persistence;
 using Hangfire;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
-using Microsoft.AspNetCore.RateLimiting;
+using Microsoft.AspNetCore.Authorization;
 using Microsoft.Extensions.Options;
 using Microsoft.IdentityModel.Tokens;
 using Scalar.AspNetCore;
@@ -17,19 +18,22 @@ using Serilog;
 
 var builder = WebApplication.CreateBuilder(args);
 
-// 1. Serilog Structured Logging
+// ── Logging ──
 builder.Host.UseSerilog((context, services, configuration) => configuration
     .ReadFrom.Configuration(context.Configuration)
     .ReadFrom.Services(services)
     .Enrich.FromLogContext()
     .WriteTo.Console(outputTemplate: "[{Timestamp:HH:mm:ss} {Level:u3}] [{SourceContext}] {Message:lj}{NewLine}{Exception}"));
 
-// 2. Application & Infrastructure Layers
+// ── Application & infrastructure ──
 builder.Services.AddApplicationServices();
 builder.Services.AddInfrastructureServices(builder.Configuration);
 
-// 3. JWT Bearer Authentication & Query-String WebSocket Token Interceptor
-var jwtSecret = builder.Configuration["Jwt:Secret"] ?? "SuperSecretEnterpriseEscrowKey2026!MustBeAtLeast32Bytes";
+// ── Authentication: JWT bearer (query-string token accepted only for the SignalR hub) ──
+var jwtSecret = builder.Configuration["Jwt:Secret"];
+if (string.IsNullOrWhiteSpace(jwtSecret) || Encoding.UTF8.GetByteCount(jwtSecret) < 32)
+    throw new InvalidOperationException("Jwt:Secret must be configured and at least 32 bytes long.");
+
 builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
     .AddJwtBearer(options =>
     {
@@ -39,119 +43,114 @@ builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
             ValidateAudience = true,
             ValidateLifetime = true,
             ValidateIssuerSigningKey = true,
-            ValidIssuer = builder.Configuration["Jwt:Issuer"] ?? "EscrowMarketplace",
-            ValidAudience = builder.Configuration["Jwt:Audience"] ?? "EscrowMarketplaceClients",
+            ValidIssuer = builder.Configuration["Jwt:Issuer"],
+            ValidAudience = builder.Configuration["Jwt:Audience"],
             IssuerSigningKey = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(jwtSecret)),
             ClockSkew = TimeSpan.FromSeconds(30)
         };
     });
-
-// Scoped query-string token extractor for /hubs/marketplace
 builder.Services.AddSingleton<IPostConfigureOptions<JwtBearerOptions>, ConfigureJwtBearerOptions>();
 
-// 4. ASP.NET Core Flow Control & Rate Limiting (Partitioned by Tenant)
+// ── Authorization: authenticated by default, roles on top ──
+builder.Services.AddAuthorization(options =>
+{
+    options.FallbackPolicy = new AuthorizationPolicyBuilder().RequireAuthenticatedUser().Build();
+    options.AddPolicy(Policies.Buyer, p => p.RequireRole(Policies.BuyerRole));
+    options.AddPolicy(Policies.Provider, p => p.RequireRole(Policies.ProviderRole));
+    options.AddPolicy(Policies.Admin, p => p.RequireRole(Policies.AdminRoles));
+});
+
+// ── Rate limiting: per user, plus a concurrency cap on checkout per tenant ──
+var requestsPerMinute = builder.Configuration.GetValue("RateLimiting:RequestsPerMinutePerUser", 120);
 builder.Services.AddRateLimiter(options =>
 {
     options.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
 
-    // Sliding window for general endpoints
-    options.AddPolicy("StandardSlidingWindow", httpContext =>
-    {
-        var tenantId = httpContext.Request.Headers["X-Tenant-Id"].FirstOrDefault() ?? "anonymous";
-        return RateLimitPartition.GetSlidingWindowLimiter(tenantId, _ => new SlidingWindowRateLimiterOptions
+    options.AddPolicy(RateLimitPolicies.PerUser, httpContext =>
+        RateLimitPartition.GetSlidingWindowLimiter(UserPartition(httpContext), _ => new SlidingWindowRateLimiterOptions
         {
-            PermitLimit = 100,
+            PermitLimit = requestsPerMinute,
             Window = TimeSpan.FromMinutes(1),
             SegmentsPerWindow = 6,
-            QueueLimit = 10
-        });
-    });
+            QueueLimit = 0
+        }));
 
-    // Concurrency limiter for checkout / booking creation
-    options.AddPolicy("CheckoutConcurrencyLimiter", httpContext =>
-    {
-        var tenantId = httpContext.Request.Headers["X-Tenant-Id"].FirstOrDefault() ?? "anonymous";
-        return RateLimitPartition.GetConcurrencyLimiter(tenantId, _ => new ConcurrencyLimiterOptions
+    options.AddPolicy(RateLimitPolicies.Checkout, httpContext =>
+        RateLimitPartition.GetConcurrencyLimiter(TenantPartition(httpContext), _ => new ConcurrencyLimiterOptions
         {
-            PermitLimit = 10,
-            QueueLimit = 20
-        });
-    });
+            PermitLimit = 20,
+            QueueLimit = 50
+        }));
 });
 
-// 5. Controllers with String Enum Serialization & OpenAPI / Scalar
+// ── MVC, enums as strings, OpenAPI ──
 builder.Services.AddControllers()
     .AddJsonOptions(options =>
-    {
-        options.JsonSerializerOptions.Converters.Add(new System.Text.Json.Serialization.JsonStringEnumConverter());
-    });
+        options.JsonSerializerOptions.Converters.Add(new System.Text.Json.Serialization.JsonStringEnumConverter()));
 builder.Services.AddOpenApi();
-builder.Services.AddEndpointsApiExplorer();
 
 var app = builder.Build();
 
-// 6. Database Initialization & Seeding
+// ── Schema, exclusion constraint and demo seed ──
 using (var scope = app.Services.CreateScope())
 {
     var initializer = scope.ServiceProvider.GetRequiredService<MarketplaceDbContextInitializer>();
     await initializer.InitializeAsync();
 }
 
-// 7. Middlewares Pipeline
+// ── Pipeline ──
+app.UseMiddleware<GlobalExceptionMiddleware>();
 app.UseDefaultFiles();
 app.UseStaticFiles();
-
-app.UseMiddleware<GlobalExceptionMiddleware>();
-app.UseMiddleware<TenantMiddleware>();
-
 app.UseSerilogRequestLogging();
-app.UseRateLimiter();
 
 app.UseAuthentication();
 app.UseAuthorization();
+app.UseMiddleware<TenantMiddleware>(); // tenant + actor come from the validated JWT only
+app.UseRateLimiter();
 
-// 8. API Documentation (OpenAPI + Scalar)
-if (app.Environment.IsDevelopment() || true)
+if (app.Configuration.GetValue("ApiDocs:Enabled", true))
 {
-    app.MapOpenApi();
+    app.MapOpenApi().AllowAnonymous();
     app.MapScalarApiReference(options =>
     {
-        options.Title = "Real-Time Escrow & Booking Marketplace API";
+        options.Title = "Escrow & Booking Marketplace API";
         options.Theme = ScalarTheme.Purple;
-        options.DefaultHttpClient = new KeyValuePair<ScalarTarget, ScalarClient>(ScalarTarget.CSharp, ScalarClient.HttpClient);
-    });
+    }).AllowAnonymous();
 }
 
-// 9. SignalR Hub Mapping with Authentication Expiration & Refresh Options
+app.MapGet("/health", () => Results.Ok(new { status = "ok" })).AllowAnonymous();
+
 app.MapHub<MarketplaceBookingHub>("/hubs/marketplace", options =>
 {
     options.CloseOnAuthenticationExpiration = true;
 });
 
-// 10. Hangfire Dashboard & Scheduled Recurring Jobs
-if (!builder.Configuration.GetValue<bool>("UseInMemoryDatabase"))
+if (EscrowMarketplace.Infrastructure.DependencyInjection.IsHangfireEnabled(app.Configuration))
 {
-    app.UseHangfireDashboard("/hangfire", new DashboardOptions
-    {
-        DashboardTitle = "Escrow Marketplace Background Jobs"
-    });
+    // Dashboard is local-requests-only by default (Hangfire's LocalRequestsOnlyAuthorizationFilter).
+    app.UseHangfireDashboard("/hangfire", new DashboardOptions { DashboardTitle = "Escrow Marketplace Jobs" });
 
     RecurringJob.AddOrUpdate<LedgerReconciliationJob>(
         "nightly-ledger-reconciliation",
         job => job.RunDailyReconciliationAsync(CancellationToken.None),
-        Cron.Daily(2)); // Runs daily at 2:00 AM UTC
+        Cron.Daily(2));
 
-    RecurringJob.AddOrUpdate<EscrowTimeoutCleanupJob>(
-        "escrow-timeout-hold-cleanup",
-        job => job.ReleaseExpiredHoldsAsync(CancellationToken.None),
-        "*/10 * * * *"); // Runs every 10 minutes
+    // Replaced by saga timeouts; remove the old polling job if an earlier version registered it.
+    RecurringJob.RemoveIfExists("escrow-timeout-hold-cleanup");
 }
 
 app.MapControllers();
 
-app.Logger.LogInformation("Scalar Interactive API Reference available at: http://localhost:5000/scalar/v1 (or http://localhost:5090/scalar/v1)");
-
 app.Run();
+
+static string UserPartition(HttpContext httpContext) =>
+    httpContext.User.FindFirstValue(ClaimTypes.NameIdentifier)
+    ?? httpContext.Connection.RemoteIpAddress?.ToString()
+    ?? "anonymous";
+
+static string TenantPartition(HttpContext httpContext) =>
+    httpContext.User.FindFirstValue("tenant_id") ?? "anonymous";
 
 // Required for WebApplicationFactory in integration tests
 public partial class Program { }

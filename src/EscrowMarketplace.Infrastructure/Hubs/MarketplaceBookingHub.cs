@@ -1,11 +1,22 @@
 using System.Security.Claims;
-using EscrowMarketplace.Application.Common.Interfaces;
+using EscrowMarketplace.Infrastructure.Services;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.SignalR;
 using Microsoft.Extensions.Logging;
 
 namespace EscrowMarketplace.Infrastructure.Hubs;
 
+public static class HubGroups
+{
+    public static string User(Guid userId) => $"user:{userId}";
+    public static string TenantAdmins(Guid tenantId) => $"tenant:{tenantId}:admins";
+}
+
+/// <summary>
+/// Push-only hub. Group membership comes only from the validated JWT (no query-string fallbacks
+/// and no "subscribe to any booking id"), so a client can only receive updates for its own
+/// bookings, or for its tenant if it is an admin.
+/// </summary>
 [Authorize]
 public class MarketplaceBookingHub : Hub<IBookingClient>
 {
@@ -18,56 +29,24 @@ public class MarketplaceBookingHub : Hub<IBookingClient>
 
     public override async Task OnConnectedAsync()
     {
-        var httpContext = Context.GetHttpContext();
         var user = Context.User;
+        var userIdValue = user?.FindFirst(ClaimTypes.NameIdentifier)?.Value ?? user?.FindFirst("sub")?.Value;
+        var tenantIdValue = user?.FindFirst("tenant_id")?.Value;
 
-        // Extract tenant ID from claim or query string
-        var tenantId = user?.FindFirst("tenant_id")?.Value 
-            ?? httpContext?.Request.Query["tenant_id"].ToString();
-
-        var userId = user?.FindFirst(ClaimTypes.NameIdentifier)?.Value 
-            ?? user?.FindFirst("sub")?.Value 
-            ?? httpContext?.Request.Query["user_id"].ToString();
-
-        if (!string.IsNullOrEmpty(tenantId))
+        if (!Guid.TryParse(userIdValue, out var userId) || !Guid.TryParse(tenantIdValue, out var tenantId))
         {
-            var tenantGroup = $"tenant:{tenantId}";
-            await Groups.AddToGroupAsync(Context.ConnectionId, tenantGroup);
-            _logger.LogInformation("SignalR Connection {ConnectionId} joined {Group}", Context.ConnectionId, tenantGroup);
+            _logger.LogWarning("Rejecting SignalR connection {ConnectionId}: token is missing user or tenant claims.", Context.ConnectionId);
+            Context.Abort();
+            return;
         }
 
-        if (!string.IsNullOrEmpty(userId))
+        await Groups.AddToGroupAsync(Context.ConnectionId, HubGroups.User(userId));
+
+        if (user!.IsInRole("Admin") || user.IsInRole("Manager"))
         {
-            var userGroup = $"user:{userId}";
-            await Groups.AddToGroupAsync(Context.ConnectionId, userGroup);
-            _logger.LogInformation("SignalR Connection {ConnectionId} joined {Group}", Context.ConnectionId, userGroup);
+            await Groups.AddToGroupAsync(Context.ConnectionId, HubGroups.TenantAdmins(tenantId));
         }
 
         await base.OnConnectedAsync();
-    }
-
-    public override async Task OnDisconnectedAsync(Exception? exception)
-    {
-        _logger.LogInformation("SignalR Connection {ConnectionId} disconnected", Context.ConnectionId);
-        await base.OnDisconnectedAsync(exception);
-    }
-
-    public async Task SubscribeToBooking(string bookingId)
-    {
-        var group = $"booking:{bookingId}";
-        await Groups.AddToGroupAsync(Context.ConnectionId, group);
-        _logger.LogInformation("Connection {ConnectionId} subscribed to {Group}", Context.ConnectionId, group);
-    }
-
-    public async Task UnsubscribeFromBooking(string bookingId)
-    {
-        var group = $"booking:{bookingId}";
-        await Groups.RemoveFromGroupAsync(Context.ConnectionId, group);
-    }
-
-    public async Task SubscribeToResource(string resourceId)
-    {
-        var group = $"resource:{resourceId}";
-        await Groups.AddToGroupAsync(Context.ConnectionId, group);
     }
 }

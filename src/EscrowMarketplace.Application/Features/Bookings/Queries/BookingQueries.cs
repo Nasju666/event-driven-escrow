@@ -1,5 +1,7 @@
 using EscrowMarketplace.Application.Common.Interfaces;
+using EscrowMarketplace.Application.Common.Mappings;
 using EscrowMarketplace.Application.Common.Models;
+using EscrowMarketplace.Application.Common.Security;
 using EscrowMarketplace.Domain.Entities;
 using EscrowMarketplace.Domain.Enums;
 using EscrowMarketplace.Domain.Exceptions;
@@ -13,106 +15,101 @@ public record GetBookingByIdQuery(Guid BookingId) : IRequest<BookingDto>;
 public class GetBookingByIdQueryHandler : IRequestHandler<GetBookingByIdQuery, BookingDto>
 {
     private readonly IReadDbContext _readContext;
+    private readonly ICurrentActor _actor;
 
-    public GetBookingByIdQueryHandler(IReadDbContext readContext)
+    public GetBookingByIdQueryHandler(IReadDbContext readContext, ICurrentActor actor)
     {
         _readContext = readContext;
+        _actor = actor;
     }
 
     public async Task<BookingDto> Handle(GetBookingByIdQuery request, CancellationToken cancellationToken)
     {
-        var booking = await _readContext.Bookings
-            .AsNoTracking()
-            .Include(b => b.Resource)
-            .Include(b => b.Buyer)
-            .Include(b => b.Provider)
-            .FirstOrDefaultAsync(b => b.Id == request.BookingId, cancellationToken)
-            ?? throw new NotFoundException(nameof(BookingDto), request.BookingId);
-
-        return new BookingDto(
-            booking.Id,
-            booking.TenantId,
-            booking.ResourceId,
-            booking.Resource?.Title ?? string.Empty,
-            booking.BuyerId,
-            booking.Buyer?.FullName ?? string.Empty,
-            booking.ProviderId,
-            booking.Provider?.FullName ?? string.Empty,
-            booking.Period.Start,
-            booking.Period.End,
-            booking.TotalAmount,
-            booking.Currency,
-            booking.Status,
-            booking.RowVersion,
-            booking.CreatedAt);
+        var dto = await _readContext.GetBookingDtoAsync(request.BookingId, cancellationToken);
+        _actor.EnsureCanView(dto.Id, dto.BuyerId, dto.ProviderId);
+        return dto;
     }
 }
 
-public record GetBookingsByTenantQuery(
+/// <summary>
+/// Buyers see their own bookings, providers see bookings on their resources,
+/// admins see every booking in the tenant. Tenant scoping comes from the global query filter.
+/// </summary>
+public record GetBookingsQuery(
     BookingStatus? Status = null,
-    Guid? BuyerId = null,
-    Guid? ProviderId = null,
     int Page = 1,
-    int PageSize = 20
+    int PageSize = 50
 ) : IRequest<IReadOnlyList<BookingDto>>;
 
-public class GetBookingsByTenantQueryHandler : IRequestHandler<GetBookingsByTenantQuery, IReadOnlyList<BookingDto>>
+public class GetBookingsQueryHandler : IRequestHandler<GetBookingsQuery, IReadOnlyList<BookingDto>>
 {
     private readonly IReadDbContext _readContext;
+    private readonly ICurrentActor _actor;
 
-    public GetBookingsByTenantQueryHandler(IReadDbContext readContext)
+    public GetBookingsQueryHandler(IReadDbContext readContext, ICurrentActor actor)
     {
         _readContext = readContext;
+        _actor = actor;
     }
 
-    public async Task<IReadOnlyList<BookingDto>> Handle(GetBookingsByTenantQuery request, CancellationToken cancellationToken)
+    public async Task<IReadOnlyList<BookingDto>> Handle(GetBookingsQuery request, CancellationToken cancellationToken)
     {
-        var query = _readContext.Bookings
-            .AsNoTracking()
-            .Include(b => b.Resource)
-            .Include(b => b.Buyer)
-            .Include(b => b.Provider)
-            .AsQueryable();
+        var query = _readContext.Bookings.AsQueryable();
+
+        if (!_actor.IsAdmin())
+        {
+            var userId = _actor.RequireUserId();
+            query = _actor.Role == UserRole.Provider
+                ? query.Where(b => b.ProviderId == userId)
+                : query.Where(b => b.BuyerId == userId);
+        }
 
         if (request.Status.HasValue)
         {
             query = query.Where(b => b.Status == request.Status.Value);
         }
 
-        if (request.BuyerId.HasValue)
-        {
-            query = query.Where(b => b.BuyerId == request.BuyerId.Value);
-        }
+        var page = Math.Max(1, request.Page);
+        var pageSize = Math.Clamp(request.PageSize, 1, 100);
 
-        if (request.ProviderId.HasValue)
-        {
-            query = query.Where(b => b.ProviderId == request.ProviderId.Value);
-        }
-
-        var results = await query
+        return await query
             .OrderByDescending(b => b.CreatedAt)
-            .Skip((request.Page - 1) * request.PageSize)
-            .Take(request.PageSize)
-            .Select(b => new BookingDto(
-                b.Id,
-                b.TenantId,
-                b.ResourceId,
-                b.Resource != null ? b.Resource.Title : string.Empty,
-                b.BuyerId,
-                b.Buyer != null ? b.Buyer.FullName : string.Empty,
-                b.ProviderId,
-                b.Provider != null ? b.Provider.FullName : string.Empty,
-                b.Period.Start,
-                b.Period.End,
-                b.TotalAmount,
-                b.Currency,
-                b.Status,
-                b.RowVersion,
-                b.CreatedAt
-            ))
+            .Skip((page - 1) * pageSize)
+            .Take(pageSize)
+            .Select(BookingMappings.ToDto)
             .ToListAsync(cancellationToken);
+    }
+}
 
-        return results;
+public record GetBookingWorkflowQuery(Guid BookingId) : IRequest<WorkflowStateDto>;
+
+public class GetBookingWorkflowQueryHandler : IRequestHandler<GetBookingWorkflowQuery, WorkflowStateDto>
+{
+    private readonly IReadDbContext _readContext;
+    private readonly ICurrentActor _actor;
+    private readonly IEscrowWorkflowReader _workflowReader;
+
+    public GetBookingWorkflowQueryHandler(IReadDbContext readContext, ICurrentActor actor, IEscrowWorkflowReader workflowReader)
+    {
+        _readContext = readContext;
+        _actor = actor;
+        _workflowReader = workflowReader;
+    }
+
+    public async Task<WorkflowStateDto> Handle(GetBookingWorkflowQuery request, CancellationToken cancellationToken)
+    {
+        var participants = await _readContext.Bookings
+            .Where(b => b.Id == request.BookingId)
+            .Select(b => new { b.BuyerId, b.ProviderId })
+            .FirstOrDefaultAsync(cancellationToken)
+            ?? throw new NotFoundException(nameof(Booking), request.BookingId);
+
+        _actor.EnsureCanView(request.BookingId, participants.BuyerId, participants.ProviderId);
+
+        // The saga row is created asynchronously when the outbox delivers BookingSlotReservedEvent,
+        // so it can lag the booking by a moment.
+        return await _workflowReader.GetAsync(request.BookingId, cancellationToken)
+            ?? throw new NotFoundException("Escrow workflow", request.BookingId);
     }
 }
 
@@ -124,6 +121,9 @@ public record GetAvailableSlotsQuery(
 
 public class GetAvailableSlotsQueryHandler : IRequestHandler<GetAvailableSlotsQuery, IReadOnlyList<TimeSlotDto>>
 {
+    private static readonly BookingStatus[] FreeSlotStatuses =
+        { BookingStatus.Cancelled, BookingStatus.Expired, BookingStatus.Refunded };
+
     private readonly IReadDbContext _readContext;
 
     public GetAvailableSlotsQueryHandler(IReadDbContext readContext)
@@ -133,41 +133,32 @@ public class GetAvailableSlotsQueryHandler : IRequestHandler<GetAvailableSlotsQu
 
     public async Task<IReadOnlyList<TimeSlotDto>> Handle(GetAvailableSlotsQuery request, CancellationToken cancellationToken)
     {
-        var resource = await _readContext.BookableResources
-            .AsNoTracking()
-            .FirstOrDefaultAsync(r => r.Id == request.ResourceId, cancellationToken)
-            ?? throw new NotFoundException(nameof(BookableResource), request.ResourceId);
+        var resourceExists = await _readContext.BookableResources
+            .AnyAsync(r => r.Id == request.ResourceId, cancellationToken);
+        if (!resourceExists)
+            throw new NotFoundException(nameof(BookableResource), request.ResourceId);
 
-        // Define operating window (8:00 AM to 8:00 PM UTC by default)
-        var dayStartUtc = request.TargetDate.ToDateTime(new TimeOnly(8, 0), DateTimeKind.Utc);
-        var dayEndUtc = request.TargetDate.ToDateTime(new TimeOnly(20, 0), DateTimeKind.Utc);
+        var slotMinutes = Math.Clamp(request.SlotDurationMinutes, 15, 240);
 
-        var existingBookings = await _readContext.Bookings
-            .AsNoTracking()
+        // Operating window 08:00–20:00 UTC. Per-resource opening hours would be the next step.
+        var dayStart = new DateTimeOffset(request.TargetDate.ToDateTime(new TimeOnly(8, 0)), TimeSpan.Zero);
+        var dayEnd = new DateTimeOffset(request.TargetDate.ToDateTime(new TimeOnly(20, 0)), TimeSpan.Zero);
+
+        var existing = await _readContext.Bookings
             .Where(b => b.ResourceId == request.ResourceId
-                     && b.Status != BookingStatus.Cancelled
-                     && b.Status != BookingStatus.Expired
-                     && b.Status != BookingStatus.Refunded
-                     && b.Period.Start < dayEndUtc
-                     && b.Period.End > dayStartUtc)
+                     && !FreeSlotStatuses.Contains(b.Status)
+                     && b.Period.Start < dayEnd
+                     && b.Period.End > dayStart)
+            .Select(b => new { b.Period.Start, b.Period.End })
             .ToListAsync(cancellationToken);
 
         var slots = new List<TimeSlotDto>();
-        var current = dayStartUtc;
-        var step = TimeSpan.FromMinutes(request.SlotDurationMinutes);
-
-        while (current + step <= dayEndUtc)
+        var step = TimeSpan.FromMinutes(slotMinutes);
+        for (var current = dayStart; current + step <= dayEnd; current += step)
         {
             var slotEnd = current + step;
-            var isOverlapping = existingBookings.Any(b => b.Period.Start < slotEnd && b.Period.End > current);
-
-            slots.Add(new TimeSlotDto(
-                StartTime: current,
-                EndTime: slotEnd,
-                IsAvailable: !isOverlapping
-            ));
-
-            current = slotEnd;
+            var taken = existing.Any(b => b.Start < slotEnd && b.End > current);
+            slots.Add(new TimeSlotDto(current, slotEnd, !taken));
         }
 
         return slots;
